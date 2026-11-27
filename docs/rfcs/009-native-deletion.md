@@ -2,7 +2,7 @@
 
 Status: accepted
 
-Deletion is explicit source-store mutation. Session browser requires `Delete` plus `y`; `a` suppresses later prompts only for current browser process. OmniSession deletes exact selected native session and then verifies provider discovery and direct read no longer find ID.
+Deletion is explicit source-store mutation. Session browser requires `Delete` or `Ctrl-D`, then `y`, for every deletion. OmniSession deletes exact selected native session and then verifies provider discovery and direct read no longer find ID.
 
 Common requirements:
 

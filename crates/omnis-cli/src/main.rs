@@ -4,10 +4,12 @@ use std::{
     collections::{BTreeMap, BinaryHeap, HashMap, HashSet},
     env,
     ffi::OsString,
+    fmt,
     fs::{self, File},
     io::{self, BufReader, IsTerminal, Read, Seek, Write},
     path::{Path, PathBuf},
     process::{Child, Command, ExitCode, ExitStatus, Stdio},
+    sync::OnceLock,
     thread,
     time::Duration,
 };
@@ -25,9 +27,9 @@ use omnis_core::{
     build_native_materialization_report_for_snapshot, build_official_import_report_for_snapshot,
     build_semantic_handoff_report_for_snapshot, fidelity_report_for_snapshot, redact_json_secrets,
     redact_secrets, render_markdown_export, render_semantic_handoff,
-    render_session_history_preview, safe_terminal_line, trajectory_search_document,
-    workspace_paths_match, workspace_remote_fingerprint, workspace_remote_fingerprints,
-    workspace_root, workspace_state_matches_for_provider,
+    render_session_history_preview, safe_terminal_line, safe_terminal_text,
+    trajectory_search_document, workspace_paths_match, workspace_remote_fingerprint,
+    workspace_remote_fingerprints, workspace_root, workspace_state_matches_for_provider,
 };
 use omnis_ir::{
     BundleManifest, CanonicalSnapshot, EventKind, FidelityEntry, FidelityReport, FidelityStatus,
@@ -46,6 +48,16 @@ use tempfile::NamedTempFile;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use uuid::Uuid;
 use wait_timeout::ChildExt;
+
+// The standard macros panic when a reader such as `head` closes the pipe. These take their place in
+// every module below.
+macro_rules! println {
+    () => { $crate::print_line(format_args!("")) };
+    ($($arg:tt)*) => { $crate::print_line(format_args!($($arg)*)) };
+}
+macro_rules! eprintln {
+    ($($arg:tt)*) => { $crate::print_error_line(format_args!($($arg)*)) };
+}
 
 mod antigravity_import;
 mod cached_database_aliases;
@@ -3247,7 +3259,7 @@ fn search_json(
                 "provider": hit.session.session.provider,
                 // Titles can quote prompts, so titles and transcript text stay out unless requested.
                 "title": hit.title.as_ref().filter(|_| args.show_text),
-                "project_path": hit.session.project_path,
+                "project_path": hit.session.project_path.as_deref().map(json_path),
                 "updated_at": hit.session.updated_at,
                 "match": if hit.conversation.is_some() { "conversation" } else { "metadata" },
                 "snippet": hit.conversation.as_ref().filter(|_| args.show_text).map(|conversation| search_snippet(&conversation.snippet)),
@@ -3495,12 +3507,47 @@ fn search_output_width() -> usize {
 
 fn write_search_output(text: &str) -> Result<()> {
     let mut stdout = io::stdout().lock();
-    match stdout
-        .write_all(text.as_bytes())
-        .and_then(|()| stdout.flush())
+    ignore_closed_pipe(
+        stdout
+            .write_all(text.as_bytes())
+            .and_then(|()| stdout.flush())
+            .context("writing search results"),
+    )
+}
+
+/// A reader that closes the pipe, such as `head`, wants no more output. That is not a failure.
+fn ignore_closed_pipe(result: Result<()>) -> Result<()> {
+    result.or_else(|error| {
+        if error
+            .downcast_ref::<io::Error>()
+            .is_some_and(|cause| cause.kind() == io::ErrorKind::BrokenPipe)
+        {
+            return Ok(());
+        }
+        Err(error)
+    })
+}
+
+/// The first line that could not be printed for a reason other than a closed pipe.
+static PRINT_FAILURE: OnceLock<io::Error> = OnceLock::new();
+
+fn print_line(line: fmt::Arguments<'_>) {
+    if let Err(error) = writeln!(io::stdout().lock(), "{line}")
+        && error.kind() != io::ErrorKind::BrokenPipe
     {
-        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
-        result => result.context("writing search results"),
+        // Commands print after they commit their work, so the run continues and then fails.
+        let _ = PRINT_FAILURE.set(error);
+    }
+}
+
+fn print_error_line(line: fmt::Arguments<'_>) {
+    let _ = writeln!(io::stderr().lock(), "{line}");
+}
+
+fn check_printed() -> Result<()> {
+    match PRINT_FAILURE.get() {
+        Some(error) => bail!("writing output: {error}"),
+        None => Ok(()),
     }
 }
 
@@ -3628,13 +3675,23 @@ struct AdaptersArgs {
 
 #[derive(Debug, Args)]
 struct ListArgs {
-    #[arg(long)]
+    #[arg(long, help = "List only one source provider")]
     provider: Option<Provider>,
-    #[arg(long, value_name = "PATH", default_value = ".")]
+    #[arg(
+        long,
+        value_name = "PATH",
+        default_value = ".",
+        help = "Project to list"
+    )]
     project: PathBuf,
     #[arg(long, help = "List sessions across all known workspaces")]
     all_projects: bool,
-    #[arg(long, default_value_t = 50)]
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 50,
+        help = "Maximum sessions to print"
+    )]
     limit: usize,
 }
 
@@ -3710,7 +3767,12 @@ struct MarkdownArgs {
         help = "Provider-qualified reference or exact session ID"
     )]
     source: String,
-    #[arg(short, long, value_name = "FILE")]
+    #[arg(
+        short,
+        long,
+        value_name = "FILE",
+        help = "New file to write; omit to print to standard output"
+    )]
     output: Option<PathBuf>,
 }
 
@@ -3766,7 +3828,7 @@ struct ResumeArgs {
         help = "Start interactive selection across all workspaces"
     )]
     all_projects: bool,
-    #[arg(long)]
+    #[arg(long, help = "Show the plan without importing or launching anything")]
     dry_run: bool,
     #[arg(
         long,
@@ -3795,7 +3857,7 @@ struct ResumeArgs {
         value_enum,
         value_name = "MODE",
         conflicts_with = "materialize_only",
-        help = "Permission mode the agent starts in; without it no permission flags are passed and the agent keeps its own default"
+        help = "Permission mode the agent starts in (default: OMNI_MODE, or no permission flags so that the agent keeps its own default)"
     )]
     mode: Option<launch_mode::ModeKind>,
 }
@@ -3813,7 +3875,7 @@ struct ForkArgs {
         help = "Target agent or launch profile; omit to choose interactively"
     )]
     target: Option<AgentTarget>,
-    #[arg(long)]
+    #[arg(long, help = "Show the plan without importing or launching anything")]
     dry_run: bool,
     #[arg(
         long,
@@ -3830,7 +3892,7 @@ struct ForkArgs {
         value_enum,
         value_name = "MODE",
         conflicts_with = "materialize_only",
-        help = "Permission mode the agent starts in; without it no permission flags are passed and the agent keeps its own default"
+        help = "Permission mode the agent starts in (default: OMNI_MODE, or no permission flags so that the agent keeps its own default)"
     )]
     mode: Option<launch_mode::ModeKind>,
     #[arg(
@@ -3847,15 +3909,15 @@ struct ForkArgs {
 struct SwitchArgs {
     #[arg(value_name = "AGENT", help = "Target agent or launch profile")]
     target: AgentTarget,
-    #[arg(long)]
+    #[arg(long, help = "Show the plan without importing or launching anything")]
     dry_run: bool,
-    #[arg(long, default_value = "main")]
+    #[arg(long, default_value = "main", help = "Task branch to move")]
     branch: String,
     #[arg(
         long,
         value_enum,
         value_name = "MODE",
-        help = "Permission mode the agent starts in; without it no permission flags are passed and the agent keeps its own default"
+        help = "Permission mode the agent starts in (default: OMNI_MODE, or no permission flags so that the agent keeps its own default)"
     )]
     mode: Option<launch_mode::ModeKind>,
 }
@@ -3870,27 +3932,34 @@ struct TaskArgs {
 enum TaskCommand {
     /// Create and select a task for current workspace.
     Start {
+        #[arg(help = "Task name; an existing task is selected again")]
         name: String,
-        #[arg(long)]
+        #[arg(
+            long,
+            value_name = "SESSION",
+            help = "Provider-qualified session to bind to the branch"
+        )]
         from: Option<SessionRef>,
-        #[arg(long, default_value = "main")]
+        #[arg(long, default_value = "main", help = "Task branch to bind")]
         branch: String,
     },
     /// Show selected task and branch head.
     Status {
-        #[arg(long, default_value = "main")]
+        #[arg(long, default_value = "main", help = "Task branch to show")]
         branch: String,
     },
     /// Bind selected task branch to a verified native session.
     Bind {
+        #[arg(help = "Provider-qualified session reference")]
         session: SessionRef,
-        #[arg(long, default_value = "main")]
+        #[arg(long, default_value = "main", help = "Task branch to bind")]
         branch: String,
     },
 }
 
 #[derive(Debug, Args)]
 struct CheckoutArgs {
+    #[arg(help = "Name of an existing task in the current workspace")]
     name: String,
 }
 
@@ -3901,23 +3970,31 @@ struct ExportArgs {
         help = "Provider-qualified reference or exact session ID"
     )]
     session: String,
-    #[arg(short, long, value_name = "FILE")]
+    #[arg(
+        short,
+        long,
+        value_name = "FILE",
+        help = "New bundle file to write; an existing file is never overwritten"
+    )]
     output: PathBuf,
 }
 
 #[derive(Debug, Args)]
 struct ImportArgs {
+    #[arg(value_name = "FILE", help = "Bundle file written by `omni export`")]
     input: PathBuf,
 }
 
 fn main() -> ExitCode {
-    let result = interrupt::with_provider_probes(|| run(Cli::parse()));
+    let result =
+        interrupt::with_provider_probes(|| run(Cli::parse()).and_then(|()| check_printed()));
     match result {
         Ok(()) => ExitCode::SUCCESS,
         // The command already reported the interrupted work.
         Err(error) if error.is::<interrupt::Interrupted>() => ExitCode::from(130),
         Err(error) => {
-            let _ = writeln!(io::stderr().lock(), "error: {error:#}");
+            // Errors can quote text from a session store or an imported bundle.
+            eprintln!("error: {}", safe_terminal_text(&format!("{error:#}")));
             match error.downcast_ref::<ProviderExit>() {
                 // Keep the provider's own status, including Windows codes wider than a byte.
                 Some(ProviderExit(status)) => {
@@ -3933,13 +4010,16 @@ fn run(cli: Cli) -> Result<()> {
     if let Err(error) =
         Store::open_default().and_then(|store| store.redact_legacy_index_titles(redact_secrets))
     {
-        eprintln!("warning: local index migration: {error}");
+        eprintln!(
+            "warning: local index migration: {:#}",
+            anyhow::Error::from(error)
+        );
     }
     let command = command_or_resume(cli.command);
     if discovers_imported_sources(&command)
         && let Err(error) = backfill_missing_imported_sources()
     {
-        eprintln!("warning: local imported source migration: {error}");
+        eprintln!("warning: local imported source migration: {error:#}");
     }
     let registry = AdapterRegistry::with_local_adapters();
     match command {
@@ -3955,10 +4035,10 @@ fn run(cli: Cli) -> Result<()> {
             handoff::run(&registry, &source, None, cli.json)
         }
         Commands::Inspect(args) => inspect(&registry, &args, cli.json),
-        Commands::Resume(args) => resume(&registry, &args, cli.json, None),
-        Commands::Fork(args) => fork(&registry, &args, cli.json),
+        Commands::Resume(args) => preview(args.dry_run, resume(&registry, &args, cli.json, None)),
+        Commands::Fork(args) => preview(args.dry_run, fork(&registry, &args, cli.json)),
         Commands::Search(args) => search_sessions(&registry, &args, cli.json),
-        Commands::Switch(args) => switch(&registry, &args, cli.json),
+        Commands::Switch(args) => preview(args.dry_run, switch(&registry, &args, cli.json)),
         Commands::Task(args) => task(&registry, args, cli.json),
         Commands::Checkout(args) => checkout(&args, cli.json),
         Commands::Export(args) => export(&registry, &args, cli.json),
@@ -3970,6 +4050,15 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Adapters(args) => adapters(&registry, &args, cli.json),
         Commands::Profiles => launch_profile::list(cli.json),
         Commands::Index(args) => build_search_index(&registry, &args, cli.json),
+    }
+}
+
+/// A preview only prints, so a closed pipe ends it quietly. A transfer still stops.
+fn preview(dry_run: bool, result: Result<()>) -> Result<()> {
+    if dry_run {
+        ignore_closed_pipe(result)
+    } else {
+        result
     }
 }
 
@@ -4129,18 +4218,22 @@ fn doctor(registry: &AdapterRegistry, json_output: bool) -> Result<()> {
             "installed": status.installed(),
             "source_detected": status.source_detected,
             "launcher_detected": status.launcher.is_some(),
-            "executable": status.launcher,
-            "data_root": status.installation.data_root,
+            "executable": status.launcher.as_deref().map(json_path),
+            "data_root": status.installation.data_root.as_deref().map(json_path),
             "sessions": sessions,
             "native_writer_readiness": status.native_writer_readiness(),
             "native_import_check": import_check,
         }));
     }
 
-    let store = Store::open_default().context("opening OmniSession state")?;
-    let selected = store
-        .selected_task(&project)
-        .context("reading selected task")?;
+    // Unusable state fails the command, after the provider report that it does not affect.
+    let selected = Store::open_default()
+        .context("opening OmniSession state")
+        .and_then(|store| {
+            store
+                .selected_task(&project)
+                .context("reading selected task")
+        });
     if json_output {
         println!(
             "{}",
@@ -4148,10 +4241,10 @@ fn doctor(registry: &AdapterRegistry, json_output: bool) -> Result<()> {
                 "schema_version": SCHEMA_VERSION,
                 "version": env!("CARGO_PKG_VERSION"),
                 "providers": results,
-                "selected_task": selected.as_ref().map(|task| &task.name),
+                "selected_task": selected.as_ref().ok().and_then(Option::as_ref).map(|task| &task.name),
             }))?
         );
-        return Ok(());
+        return selected.map(drop);
     }
 
     println!("OmniSession {}", env!("CARGO_PKG_VERSION"));
@@ -4163,7 +4256,7 @@ fn doctor(registry: &AdapterRegistry, json_output: bool) -> Result<()> {
             println!("{line}");
         }
     }
-    match selected {
+    match selected? {
         Some(task) => println!("selected task: {}", task.name),
         None => println!("selected task: none"),
     }
@@ -4459,15 +4552,20 @@ fn codex_list_name(session: &SessionRef, title: Option<&str>) -> Option<String> 
     (!name.is_empty()).then(|| name.to_owned())
 }
 
+/// A path as JSON text, which has no form for bytes that are not UTF-8.
+fn json_path(path: &Path) -> std::borrow::Cow<'_, str> {
+    path.to_string_lossy()
+}
+
 fn session_json(session: &NativeSession) -> Value {
     let mut value = json!({
         "session": session.session,
-        "project_path": session.project_path,
+        "project_path": session.project_path.as_deref().map(json_path),
         "git_branch": session.git_branch,
         "created_at": session.created_at,
         "updated_at": session.updated_at,
         "event_count": session.event_count,
-        "source_path": session.source_path,
+        "source_path": session.source_path.as_deref().map(json_path),
     });
     if let Some(name) = codex_list_name(&session.session, session.title.as_deref()) {
         value["title"] = Value::String(name);
@@ -4710,11 +4808,12 @@ fn markdown(registry: &AdapterRegistry, args: &MarkdownArgs, json_output: bool) 
     let document = render_markdown_export(&snapshot);
 
     let Some(output) = &args.output else {
-        io::stdout()
-            .lock()
-            .write_all(document.as_bytes())
-            .context("writing Markdown to stdout")?;
-        return Ok(());
+        return ignore_closed_pipe(
+            io::stdout()
+                .lock()
+                .write_all(document.as_bytes())
+                .context("writing Markdown to stdout"),
+        );
     };
 
     write_markdown(output, &document)?;
@@ -4723,7 +4822,7 @@ fn markdown(registry: &AdapterRegistry, args: &MarkdownArgs, json_output: bool) 
             "{}",
             serde_json::to_string_pretty(&json!({
                 "source": source,
-                "output": output,
+                "output": json_path(output),
                 "events": snapshot.events.len(),
             }))?
         );
@@ -4737,10 +4836,9 @@ fn inspect(registry: &AdapterRegistry, args: &InspectArgs, json_output: bool) ->
     let report = inspected_fidelity(registry, args)?;
     if json_output {
         println!("{}", serde_json::to_string_pretty(&report)?);
-    } else {
-        print_fidelity(&report)?;
+        return Ok(());
     }
-    Ok(())
+    ignore_closed_pipe(print_fidelity(&report))
 }
 
 fn inspected_fidelity(registry: &AdapterRegistry, args: &InspectArgs) -> Result<FidelityReport> {
@@ -5054,7 +5152,7 @@ fn task(registry: &AdapterRegistry, args: TaskArgs, json_output: bool) -> Result
                     "{}",
                     serde_json::to_string_pretty(&json!({
                         "task": task.name,
-                        "workspace": task.workspace_root,
+                        "workspace": json_path(&task.workspace_root),
                         "branch": branch,
                         "session": from,
                     }))?
@@ -5081,7 +5179,7 @@ fn task(registry: &AdapterRegistry, args: TaskArgs, json_output: bool) -> Result
                     "{}",
                     serde_json::to_string_pretty(&json!({
                         "task": selected.as_ref().map(|task| &task.name),
-                        "workspace": project,
+                        "workspace": json_path(&project),
                         "branch": branch,
                         "session": binding.as_ref().map(|binding| &binding.session),
                     }))?
@@ -5126,7 +5224,7 @@ fn bind_task_session(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "task": selected.name,
-                "workspace": project,
+                "workspace": json_path(project),
                 "branch": branch,
                 "session": session,
             }))?
@@ -5172,8 +5270,8 @@ fn validate_session_workspace(
     };
     bail!(
         "session `{session}` belongs to `{}`, not `{}`",
-        directory.display(),
-        project.display()
+        safe_terminal_line(&directory.display().to_string()),
+        safe_terminal_line(&project.display().to_string())
     )
 }
 
@@ -5282,7 +5380,9 @@ fn checkout(args: &CheckoutArgs, json_output: bool) -> Result<()> {
     if json_output {
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({"task": task.name, "workspace": project}))?
+            serde_json::to_string_pretty(
+                &json!({"task": task.name, "workspace": json_path(&project)})
+            )?
         );
     } else {
         println!("Selected task `{}`.", task.name);
@@ -5366,8 +5466,9 @@ fn export(registry: &AdapterRegistry, args: &ExportArgs, json_output: bool) -> R
     };
     // Refuse a bundle `omni import` would reject, such as one naming a network workspace.
     validate_bundle(&bundle).context("validating exported bundle")?;
-    write_bundle(&args.output, &bundle)?;
+    // Unusable state then leaves no file that blocks the next attempt.
     let store = Store::open_default().context("opening OmniSession state")?;
+    write_bundle(&args.output, &bundle)?;
     store.save_bundle(&bundle).context("storing bundle")?;
     index_bundle_source(&store, &bundle).context("indexing bundle source")?;
     if json_output {
@@ -5375,7 +5476,7 @@ fn export(registry: &AdapterRegistry, args: &ExportArgs, json_output: bool) -> R
             "{}",
             serde_json::to_string_pretty(&json!({
                 "bundle_id": bundle.manifest.bundle_id,
-                "output": args.output,
+                "output": json_path(&args.output),
                 "events": bundle.manifest.event_count,
             }))?
         );
@@ -5394,6 +5495,10 @@ fn import(args: &ImportArgs, json_output: bool) -> Result<()> {
         .with_context(|| format!("reading `{}`", args.input.display()))?;
     if link_metadata.file_type().is_symlink() {
         bail!("refusing symlink bundle `{}`", args.input.display());
+    }
+    // Opening a named pipe would wait for a writer.
+    if !link_metadata.is_file() {
+        bail!("bundle input must be a regular file");
     }
     let file =
         File::open(&args.input).with_context(|| format!("opening `{}`", args.input.display()))?;
@@ -5780,8 +5885,8 @@ fn adapters(registry: &AdapterRegistry, args: &AdaptersArgs, json_output: bool) 
                 "installed": status.installed(),
                 "source_detected": status.source_detected,
                 "launcher_detected": status.launcher.is_some(),
-                "executable": status.launcher,
-                "data_root": status.installation.data_root,
+                "executable": status.launcher.as_deref().map(json_path),
+                "data_root": status.installation.data_root.as_deref().map(json_path),
                 "read_index": status.read_index,
                 "clean_start": status.clean_start,
                 "same_provider_resume": status.same_provider_resume,
@@ -5839,7 +5944,8 @@ fn adapters(registry: &AdapterRegistry, args: &AdaptersArgs, json_output: bool) 
 }
 
 fn current_project() -> Result<PathBuf> {
-    workspace_root(std::env::current_dir()?).context("resolving current workspace")
+    let directory = env::current_dir().context("reading current directory")?;
+    workspace_root(directory).context("resolving current workspace")
 }
 
 fn source_workspace_matches(source: &CanonicalSnapshot, project: &Path) -> bool {
@@ -5891,7 +5997,7 @@ fn launch_json(plan: &LaunchPlan) -> Value {
             .iter()
             .map(|arg| launch_profile::hide_secret_values(arg))
             .collect::<Vec<_>>(),
-        "cwd": plan.cwd,
+        "cwd": plan.cwd.as_deref().map(json_path),
         "env": plan.env.iter().map(env_change_json).collect::<Vec<_>>(),
     })
 }
@@ -5911,9 +6017,28 @@ fn env_change_json(change: &EnvChange) -> Value {
 /// credential, as it does in a shell command. Anything unexpected hides the whole value.
 fn redacted_env_value(name: &str, value: &str) -> String {
     let value = launch_profile::hide_secret_values(value);
-    redact_secrets(&format!("{name}={value}"))
-        .strip_prefix(&format!("{name}="))
-        .map_or_else(|| "[REDACTED]".to_owned(), str::to_owned)
+    if !value.is_empty() {
+        let probe = format!("{name}=x");
+        let probed = redact_secrets(&probe);
+        if probed != probe {
+            return probed
+                .strip_prefix(&format!("{name}="))
+                .unwrap_or("[REDACTED]")
+                .to_owned();
+        }
+    }
+    let redacted = redact_secrets(&format!("{name}={value}"));
+    let Some(shown) = redacted.strip_prefix(&format!("{name}=")) else {
+        return "[REDACTED]".to_owned();
+    };
+    // The rules for text end a credential at a space. This value is one argument, so a credential
+    // at its start is the whole value.
+    match shown.split_once(']') {
+        Some((label, _)) if label.starts_with("[REDACTED") && !value.starts_with(label) => {
+            format!("{label}]")
+        }
+        _ => shown.to_owned(),
+    }
 }
 
 /// The command as a shell would run it. Environment changes come first, as arguments of `env`.
@@ -5942,10 +6067,12 @@ fn run_launch(plan: &LaunchPlan) -> Result<()> {
     wait_for_launch(child, plan)
 }
 
-/// A launched provider. On Windows it also holds the console interrupt policy until it exits.
+/// A launched provider. It also holds the Ctrl+C policy until the provider exits.
 struct LaunchedProvider {
     child: Child,
-    // Ctrl+C reaches the provider, which shares the console, while `omni` keeps waiting for it.
+    // Ctrl+C reaches the provider, which shares the terminal, while `omni` keeps waiting for it.
+    #[cfg(unix)]
+    _interrupts: Option<interrupt::IgnoreScope>,
     #[cfg(windows)]
     _interrupts: Option<windows_console::InterruptScope>,
 }
@@ -6012,6 +6139,8 @@ fn check_launcher_starts(target: AgentTarget, plan: &LaunchPlan) -> Result<()> {
 
 fn spawn_launch(plan: &LaunchPlan) -> Result<LaunchedProvider> {
     let mut command = prepare_launch_command(plan)?;
+    #[cfg(unix)]
+    let interrupts = interrupt::IgnoreScope::enter();
     #[cfg(windows)]
     let interrupts = windows_console::InterruptScope::ignore();
     let child = command
@@ -6021,7 +6150,7 @@ fn spawn_launch(plan: &LaunchPlan) -> Result<LaunchedProvider> {
     provider_launch::release_codex_identity();
     Ok(LaunchedProvider {
         child,
-        #[cfg(windows)]
+        #[cfg(any(unix, windows))]
         _interrupts: interrupts,
     })
 }
@@ -7708,6 +7837,34 @@ mod launch_environment_tests {
             redacted_env_value("MODEL", "gateway/model-name"),
             "gateway/model-name"
         );
+    }
+
+    #[test]
+    fn a_credential_with_spaces_is_hidden_entirely() {
+        let plan = plan(vec![set("DEPLOY_PASSWORD", "correct horse battery staple")]);
+        let shown = format!("{} {}", display_command(&plan), launch_json(&plan));
+        assert!(!shown.contains("horse"), "{shown}");
+        assert!(shown.contains("DEPLOY_PASSWORD=[REDACTED"), "{shown}");
+        // Text around a credential stays when the name does not mark the whole value.
+        let header = redacted_env_value("HEADER", "Authorization: Bearer abcdefghijkl1234567");
+        assert!(
+            header.starts_with("Authorization: Bearer [REDACTED"),
+            "{header}"
+        );
+        assert_eq!(redacted_env_value("NOTE", "[draft] text"), "[draft] text");
+        for tricky in [
+            " leading secret",
+            ",comma secret",
+            ";semicolon secret",
+            "\"quoted\" trailing secret",
+            "=operator secret",
+            "** markdown secret",
+            "curl -s secret",
+        ] {
+            let hidden = redacted_env_value("DEPLOY_PASSWORD", tricky);
+            assert_eq!(hidden, "[REDACTED: PASSWORD]", "{tricky}");
+        }
+        assert_eq!(redacted_env_value("DEPLOY_PASSWORD", ""), "");
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use super::{
-    Attribute, Clear, ClearType, Context, DateTime, DeleteDialog, DeletePhase, DisableMouseCapture,
-    EnableMouseCapture, EnterAlternateScreen, HandoffMessage, HandoffRole, HashMap, HashSet, Hide,
+    Attribute, Clear, ClearType, Context, DateTime, DeleteDialog, DeletePhase,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    EnterAlternateScreen, HandoffMessage, HandoffRole, HashMap, HashSet, Hide,
     LeaveAlternateScreen, LineageTreeNode, Local, MoveTo, NativeSession, Path, PathBuf,
     PickerEntry, PickerState, PreviewValue, Print, Provider, Result, SessionPreview, SessionRef,
     SessionTrajectoryMatch, SetAttribute, Show, SynchronizedUpdate, UnicodeWidthChar,
@@ -287,10 +288,10 @@ pub(super) fn render_header(
         &format!("Scope  {scope} [Tab]   Source  {provider} [←/→]   Target  {target_label}"),
         DetailStyle::Accent,
     )?;
-    let query = if state.query.is_empty() {
-        "type to filter titles, folders, branches, IDs, and conversation text".to_owned()
+    let search = if state.query.is_empty() {
+        "Search › type to filter titles, folders, branches, IDs, and conversation text".to_owned()
     } else {
-        format!("{}▏", state.query)
+        input_line("Search › ", &format!("{}▏", state.query), width)
     };
     draw_line(
         output,
@@ -300,7 +301,7 @@ pub(super) fn render_header(
             width,
             height: 1,
         },
-        &format!("Search › {query}"),
+        &search,
         if state.query.is_empty() {
             DetailStyle::Muted
         } else {
@@ -793,7 +794,24 @@ pub(super) fn render_delete_dialog(
     height: usize,
 ) -> Result<()> {
     if width < 24 || height < 9 {
-        return Ok(());
+        // The dialog does not fit, but its keys are live, so the last row names the action.
+        let session = &dialog.session;
+        let line = match &dialog.phase {
+            DeletePhase::Confirm => format!("y/n · delete {session}?"),
+            DeletePhase::Deleting => format!("deleting {session}…"),
+            DeletePhase::Failed(error) => format!("Esc · delete failed: {error}"),
+        };
+        return draw_line(
+            output,
+            Rect {
+                x: 0,
+                y: height.saturating_sub(1),
+                width,
+                height: 1,
+            },
+            &line,
+            DetailStyle::Danger,
+        );
     }
     let dialog_width = width.saturating_sub(4).min(78);
     let workspace = dialog.workspace.as_deref().map_or_else(
@@ -1028,8 +1046,9 @@ pub(super) fn help_lines(
             DetailStyle::Warning,
         ));
         for warning in warnings {
+            // Warnings can name Windows paths, so keep backslash sequences as they are.
             lines.extend(
-                wrap_text(warning, width, 3)
+                wrap_words(&safe_terminal_line(warning), width, usize::MAX)
                     .into_iter()
                     .map(|line| detail_line(line, DetailStyle::Normal)),
             );
@@ -1533,12 +1552,7 @@ pub(super) fn lineage_tree_line(
     width: usize,
 ) -> DetailLine {
     let marker = if node.selected { "●" } else { "○" };
-    let key = node.session.to_string();
-    let Some(entry) = state
-        .entry_positions
-        .get(&key)
-        .and_then(|index| state.entries.get(*index))
-    else {
+    let Some(entry) = state.lineage_entry(&node.session) else {
         return detail_line(
             format!(
                 "{}{marker} {} · not indexed",
@@ -1800,10 +1814,17 @@ pub(super) fn wrap_text(value: &str, width: usize, max_lines: usize) -> Vec<Stri
     if width == 0 || max_lines == 0 {
         return Vec::new();
     }
-    let value = compact_text(value);
+    wrap_words(&compact_text(value), width, max_lines)
+}
+
+/// Wraps at spaces, and inside words wider than `width` such as CJK text, paths, and URLs.
+fn wrap_words(value: &str, width: usize, max_lines: usize) -> Vec<String> {
+    if width == 0 || max_lines == 0 {
+        return Vec::new();
+    }
     let mut lines = Vec::new();
     let mut current = String::new();
-    for word in value.split_whitespace() {
+    'words: for word in value.split_whitespace() {
         let candidate = if current.is_empty() {
             word.to_owned()
         } else {
@@ -1819,14 +1840,26 @@ pub(super) fn wrap_text(value: &str, width: usize, max_lines: usize) -> Vec<Stri
                 break;
             }
         }
-        current = truncate(word, width);
+        let mut rest = word;
+        while UnicodeWidthStr::width(rest) > width {
+            let line = take_prefix_cells(rest, width);
+            if line.is_empty() {
+                break;
+            }
+            rest = &rest[line.len()..];
+            lines.push(line);
+            if lines.len() == max_lines {
+                break 'words;
+            }
+        }
+        rest.clone_into(&mut current);
     }
     if lines.len() < max_lines && !current.is_empty() {
         lines.push(current);
     }
     if lines.len() == max_lines {
-        let consumed = lines.join(" ");
-        if consumed != value {
+        let printed = |text: &str| text.split_whitespace().map(str::len).sum::<usize>();
+        if lines.iter().map(|line| printed(line)).sum::<usize>() < printed(value) {
             let last = lines.pop().unwrap_or_default();
             lines.push(with_ellipsis(&last, width));
         }
@@ -2213,7 +2246,10 @@ pub(super) fn relative_time(updated_at: Option<DateTime<Utc>>, approximate: bool
         60..3600 => format!("{}m", seconds / 60),
         3600..86_400 => format!("{}h", seconds / 3600),
         86_400..604_800 => format!("{}d", seconds / 86_400),
-        _ => updated_at.format("%Y-%m-%d").to_string(),
+        _ => updated_at
+            .with_timezone(&Local)
+            .format("%Y-%m-%d")
+            .to_string(),
     };
     if approximate { format!("~{age}") } else { age }
 }
@@ -2271,6 +2307,17 @@ pub(super) fn truncate(value: &str, width: usize) -> String {
     }
     truncated.push('…');
     truncated
+}
+
+/// A typed value after its label. The end stays visible because that is where typing happens.
+pub(super) fn input_line(label: &str, value: &str, width: usize) -> String {
+    let value = safe_terminal_line(value);
+    let room = width.saturating_sub(UnicodeWidthStr::width(label));
+    if UnicodeWidthStr::width(value.as_str()) <= room {
+        return format!("{label}{value}");
+    }
+    let tail = take_suffix_cells(&value, room.saturating_sub(1));
+    truncate(&format!("{label}…{tail}"), width)
 }
 
 pub(super) fn truncate_middle(value: &str, width: usize) -> String {
@@ -2361,6 +2408,10 @@ impl TerminalGuard {
         let mouse = env::var_os("OMNI_NO_MOUSE")
             .is_none_or(|value| value.is_empty() || value == "0")
             && execute!(io::stdout(), EnableMouseCapture).is_ok();
+        // Without this, a pasted line break reads as Enter. Windows input does not mark pastes.
+        if cfg!(unix) {
+            let _ = execute!(io::stdout(), EnableBracketedPaste);
+        }
         Ok(Self { mouse })
     }
 }
@@ -2369,6 +2420,9 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         if self.mouse {
             let _ = execute!(io::stdout(), DisableMouseCapture);
+        }
+        if cfg!(unix) {
+            let _ = execute!(io::stdout(), DisableBracketedPaste);
         }
         let _ = execute!(io::stdout(), Show, LeaveAlternateScreen);
         let _ = disable_raw_mode();

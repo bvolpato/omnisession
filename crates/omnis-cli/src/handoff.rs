@@ -49,7 +49,7 @@ pub(super) fn run(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "source": snapshot.session,
-                "output": path,
+                "output": path.to_string_lossy(),
                 "clipboard_copied": copied,
                 "clipboard_error": clipboard_error,
                 "clipboard_bytes": compact.len(),

@@ -164,6 +164,58 @@ esac
 }
 
 #[cfg(unix)]
+#[test]
+fn a_codex_fork_is_linked_when_codex_exits_unsuccessfully() {
+    const CHILD: &str = "22222222-2222-4222-8222-222222222222";
+    let fixture = Fixture::new();
+    let codex = fixture.root.join("codex-fork");
+    fs::write(
+        &codex,
+        format!(
+            r#"#!/bin/sh
+case "$*" in
+  *--version*) echo 'codex-cli 0.167.1'; exit 0 ;;
+  *--help*) echo '  --approve-for-me'; exit 0 ;;
+esac
+# The rollout must be newer than the launch by a whole second.
+sleep 1
+now=$(date -u +%Y-%m-%dT%H:%M:%S.999Z)
+directory="$CODEX_HOME/sessions/$(date +%Y/%m/%d)"
+mkdir -p "$directory"
+printf '{{"timestamp":"%s","type":"session_meta","payload":{{"id":"{CHILD}","forked_from_id":"{SOURCE_ID}","cwd":"%s","timestamp":"%s"}}}}\n' "$now" "$(pwd -P)" "$now" > "$directory/rollout-$(date +%Y-%m-%dT%H-%M-%S)-{CHILD}.jsonl"
+exit 3
+"#
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&codex, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        output_after_write(Command::new(&codex).arg("--version"))
+            .status
+            .success()
+    );
+    let output = fixture
+        .command()
+        .env("OMNI_CODEX_BIN", &codex)
+        .args(["fork", &format!("codex:{SOURCE_ID}"), "--in", "codex"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains(&format!(
+            "Linked Codex fork `codex:{CHILD}` under `codex:{SOURCE_ID}`."
+        )),
+        "{stdout}"
+    );
+}
+
+#[cfg(unix)]
 fn write_cwd_capture_probe(path: &std::path::Path, version_output: &str) {
     fs::write(
         path,
