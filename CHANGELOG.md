@@ -1,5 +1,38 @@
 # Changelog
 
+## Unreleased
+
+**This release reads every session again once.** The first index pass after the upgrade rebuilds the search index, so stored text gets the new redaction and the history that earlier versions missed. Sessions stay searchable on their old documents until the pass reaches them. The pass needs no action, and `omni index` starts it now. In a synthetic benchmark (1,500 sessions, 208 MB), it took 16% fewer CPU instructions than the same pass with 0.10.6, and the store file grew by 12% instead of 36%. New sessions reuse that space. ([#322](https://github.com/bvolpato/omnisession/pull/322))
+
+### Added
+
+- Add a [guide](https://github.com/bvolpato/omnisession/blob/main/docs/GUIDE.md) with the complete manual, and make the README a short introduction. ([#323](https://github.com/bvolpato/omnisession/pull/323))
+- Replace the website homepage with a route map and a picker demo that you can use. Remove the Vizmatic demo. ([#320](https://github.com/bvolpato/omnisession/pull/320))
+
+### Changed
+
+- Speed up the search index. In the same benchmark, a first build takes 26% fewer CPU instructions, a pass with nothing to do takes about half, and a cached search for one word takes 28% fewer. SQLite statements stay prepared between sessions, and cached search no longer reads unused titles. ([#322](https://github.com/bvolpato/omnisession/pull/322))
+- Merge the full-text index each time a quarter of its documents was replaced, so replaced text no longer doubles it. ([#322](https://github.com/bvolpato/omnisession/pull/322))
+- Speed up redaction of source code, logs, and text that has credentials or words such as `token` and `api_key`. Plain text and colored terminal output take slightly longer because of new checks. ([#321](https://github.com/bvolpato/omnisession/pull/321))
+- Wait for a launched agent after `Ctrl-C` on Linux and macOS, and return its status. Previously `omni` ended while the agent kept the terminal. ([#318](https://github.com/bvolpato/omnisession/pull/318))
+- Ask a provider for its version and its permission modes each time when its command is a launcher that selects a program by name. Previously an upgrade behind the launcher was not visible. ([#317](https://github.com/bvolpato/omnisession/pull/317))
+
+### Fixed
+
+- Redact credentials behind terminal colors, next to text outside ASCII, behind JSON escapes, in JSON fields such as `secret_key`, in continued `curl -u` commands, in cut-off private keys, and after comparison operators and Markdown or YAML markers. Keep the line after an empty setting. ([#321](https://github.com/bvolpato/omnisession/pull/321))
+- Find sessions with queries of 11 or more words. These queries could fail with `SQL logic error`. Show the match in search snippets, return every match when `--limit` is above 512, and find quoted phrases with decomposed accents or newer emoji. ([#322](https://github.com/bvolpato/omnisession/pull/322))
+- Show the delete confirmation on small terminals, and never accept `Esc` and then `y` as a confirmation. ([#318](https://github.com/bvolpato/omnisession/pull/318))
+- Keep the selection, the preview position, and the results of a running search during background updates in the picker. Pasted text no longer acts as `Enter` on Linux and macOS. Show Pi and Oh My Pi sessions in their lineage group. ([#318](https://github.com/bvolpato/omnisession/pull/318))
+- End output quietly when the reader closes the pipe, and accept paths that are not UTF-8 in diagnostics. Remove control characters from the workspace path of an imported bundle. Hide a profile credential as a whole. ([#318](https://github.com/bvolpato/omnisession/pull/318))
+- Link a native fork when the agent ends with an error, print the `omni doctor` report before a state error, and stop waiting on a named pipe in `omni import`. ([#318](https://github.com/bvolpato/omnisession/pull/318))
+- Skip a Git remote that has no URL. A user setting could stop `omni inspect`, or give unrelated repositories the same identity. ([#318](https://github.com/bvolpato/omnisession/pull/318))
+- Index large paginated Codex rollouts that have tool calls. These were indexed with no text. Keep tool records that display records pushed out of an import, and keep rolled-back replies out of a fork. ([#317](https://github.com/bvolpato/omnisession/pull/317))
+- Read the messages before an oversized Claude Code record, list sessions in project folders named `memory` or `workflows`, and import into workspaces whose folder name is stored in decomposed Unicode. ([#317](https://github.com/bvolpato/omnisession/pull/317))
+- Read the typed text of Cursor Agent sessions instead of its context block. Delete untitled Cursor Agent sessions and every record of a Cursor IDE chat. ([#317](https://github.com/bvolpato/omnisession/pull/317))
+- Delete the SQLite side files of an Antigravity CLI conversation, and recover a deletion that stopped before its commit. ([#317](https://github.com/bvolpato/omnisession/pull/317))
+- Read Pi and Oh My Pi sessions that have an unpaired surrogate or invalid UTF-8. Import Hermes messages that look like JSON, and roll back a Hermes import that fails after its commit. Start Pi and other agents through Volta and mise style launchers. ([#317](https://github.com/bvolpato/omnisession/pull/317))
+- Remove old provider aliases with one run of the installer. Stop the installer on a signal and on a cut-off download. Support curl older than 7.71 in the in-app update, and follow a symbolic link on macOS. Fix the rollback of a failed upgrade on Windows. ([#319](https://github.com/bvolpato/omnisession/pull/319))
+
 ## 0.10.6 - 2026-11-25
 
 ### Added
