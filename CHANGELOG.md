@@ -1,18 +1,18 @@
 # Changelog
 
-## Unreleased
+## 0.10.7 - 2026-11-26
 
 **This release reads every session again once.** The first index pass after the upgrade rebuilds the search index, so stored text gets the new redaction and the history that earlier versions missed. Sessions stay searchable on their old documents until the pass reaches them. The pass needs no action, and `omni index` starts it now. In a synthetic benchmark (1,500 sessions, 208 MB), it took 16% fewer CPU instructions than the same pass with 0.10.6, and the store file grew by 12% instead of 36%. New sessions reuse that space. ([#322](https://github.com/bvolpato/omnisession/pull/322))
 
 ### Added
 
 - Add a [guide](https://github.com/bvolpato/omnisession/blob/main/docs/GUIDE.md) with the complete manual, and make the README a short introduction. ([#323](https://github.com/bvolpato/omnisession/pull/323))
-- Replace the website homepage with a route map and a picker demo that you can use. Remove the Vizmatic demo. ([#320](https://github.com/bvolpato/omnisession/pull/320))
+- Replace the website homepage with a route map and a picker demo that you can use. Remove the Vizmatic demo. ([#320](https://github.com/bvolpato/omnisession/pull/320), [#324](https://github.com/bvolpato/omnisession/pull/324))
 
 ### Changed
 
 - Speed up the search index. In the same benchmark, a first build takes 26% fewer CPU instructions, a pass with nothing to do takes about half, and a cached search for one word takes 28% fewer. SQLite statements stay prepared between sessions, and cached search no longer reads unused titles. ([#322](https://github.com/bvolpato/omnisession/pull/322))
-- Merge the full-text index each time a quarter of its documents was replaced, so replaced text no longer doubles it. ([#322](https://github.com/bvolpato/omnisession/pull/322))
+- Merge the full-text index each time a quarter of its documents was replaced, so replaced text no longer doubles it. ([#322](https://github.com/bvolpato/omnisession/pull/322), [#324](https://github.com/bvolpato/omnisession/pull/324))
 - Speed up redaction of source code, logs, and text that has credentials or words such as `token` and `api_key`. Plain text and colored terminal output take slightly longer because of new checks. ([#321](https://github.com/bvolpato/omnisession/pull/321))
 - Wait for a launched agent after `Ctrl-C` on Linux and macOS, and return its status. Previously `omni` ended while the agent kept the terminal. ([#318](https://github.com/bvolpato/omnisession/pull/318))
 - Ask a provider for its version and its permission modes each time when its command is a launcher that selects a program by name. Previously an upgrade behind the launcher was not visible. ([#317](https://github.com/bvolpato/omnisession/pull/317))
