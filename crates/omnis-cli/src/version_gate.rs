@@ -122,10 +122,34 @@ fn version_cache_path() -> Option<PathBuf> {
         .map(|root| root.join("cache").join("provider-versions.json"))
 }
 
-/// Only cache compiled native executables (never `#!` scripts or Windows command shims whose
-/// downstream target can change independently of the wrapper file).
+/// Whether the resolved file is an install of the command itself. A versioned install is named after
+/// its command or its version, such as `versions/2.1.220`. Another name can be a dispatcher, whose
+/// own file does not change when the program that it selects does.
+pub(crate) fn is_named_install(binary: &Path, canonical: &Path) -> bool {
+    let name = |value: Option<&std::ffi::OsStr>| {
+        value.and_then(std::ffi::OsStr::to_str).map(str::to_owned)
+    };
+    name(canonical.file_name())
+        .zip(name(binary.file_stem()))
+        .is_some_and(|(resolved, command)| {
+            let matches_command = if cfg!(windows) {
+                resolved
+                    .get(..command.len())
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&command))
+            } else {
+                resolved.starts_with(&command)
+            };
+            matches_command || resolved.starts_with(|first: char| first.is_ascii_digit())
+        })
+}
+
+/// Only cache compiled native executables (never `#!` scripts, Windows command shims, or links to a
+/// dispatcher whose downstream target can change independently of the wrapper file).
 fn native_binary_cache_key(binary: &Path, provider: Provider) -> Option<String> {
     let canonical = fs::canonicalize(binary).ok()?;
+    if !is_named_install(binary, &canonical) {
+        return None;
+    }
     #[cfg(windows)]
     if canonical.extension().is_some_and(|ext| {
         ext.eq_ignore_ascii_case("cmd")
@@ -193,11 +217,7 @@ pub(crate) fn command_version(
         Provider::Antigravity | Provider::Pi | Provider::OhMyPi => 8 * 1024,
         _ => 1024 * 1024,
     };
-    let parse: fn(&str) -> Option<String> = match provider {
-        Provider::CursorCli => crate::cursor_import::parse_version,
-        Provider::OhMyPi => |text| find_version(text.trim().strip_prefix("omp/").unwrap_or(text)),
-        _ => find_version,
-    };
+    let parse = version_parser(provider);
     let _home = isolate_first_codex_probe(provider, &mut command)?;
     let output = crate::interrupt::with_provider_probes(|| {
         omnis_adapters::bounded_provider_line_output(
@@ -214,6 +234,18 @@ pub(crate) fn command_version(
     let text = String::from_utf8(output.stdout)
         .with_context(|| format!("{name} version was not UTF-8"))?;
     parse(&text).with_context(|| format!("{name} returned an unrecognized version"))
+}
+
+fn version_parser(provider: Provider) -> fn(&str) -> Option<String> {
+    match provider {
+        Provider::CursorCli => crate::cursor_import::parse_version,
+        Provider::OhMyPi => |text| {
+            text.lines()
+                .map(str::trim)
+                .find_map(|line| find_version(line.strip_prefix("omp/").unwrap_or(line)))
+        },
+        _ => find_version,
+    }
 }
 
 pub(crate) fn is_at_least(version: &str, minimum: &str) -> bool {
@@ -340,6 +372,38 @@ mod tests {
             "unknown", "0.146", "build 7", "v1.2.3", "(1.2.3)", "1.2.3.4",
         ] {
             assert_eq!(find_version(output), None, "{output}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_binary_cache_skips_dispatchers_but_not_versioned_installs() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (target, link, cached) in [
+            ("mise", "codex", false),
+            ("2.1.220", "claude", true),
+            ("grok-0.2.117", "grok", true),
+        ] {
+            fs::write(dir.path().join(target), b"\x7fELFfake-binary").expect("write binary");
+            symlink(target, dir.path().join(link)).expect("link binary");
+            assert_eq!(
+                native_binary_cache_key(&dir.path().join(link), Provider::Codex).is_some(),
+                cached,
+                "{link}"
+            );
+        }
+    }
+
+    #[test]
+    fn omp_version_is_read_past_a_launcher_banner() {
+        for output in ["omp/16.4.1\n", "Now using node v22.3.0\nomp/16.4.1\n"] {
+            assert_eq!(
+                version_parser(Provider::OhMyPi)(output).as_deref(),
+                Some("16.4.1"),
+                "{output}"
+            );
         }
     }
 

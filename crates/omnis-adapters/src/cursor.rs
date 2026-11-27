@@ -185,10 +185,143 @@ fn cursor_search_time(snapshot: &CanonicalSnapshot) -> DateTime<Utc> {
 
 #[cfg(test)]
 mod tests {
-    use super::{metadata, push_cursor_ide_bubble};
+    use super::{
+        CursorAgentConversationTurnStructure, CursorAssistantMessage, CursorCliAdapter,
+        CursorConversationStateStructure, CursorConversationStep, CursorConversationTurnStructure,
+        CursorUserMessage, cursor_conversation_step, cursor_conversation_turn_structure, metadata,
+        push_cursor_ide_bubble,
+    };
+    use crate::ProviderAdapter;
     use chrono::{DateTime, Utc};
-    use omnis_ir::EventKind;
-    use serde_json::json;
+    use omnis_ir::{EventKind, Provider, SessionRef};
+    use prost::Message;
+    use serde_json::{Value, json};
+    use sha2::{Digest, Sha256};
+    use std::{fs, path::Path};
+
+    /// Writes a Cursor Agent session and returns the visible messages that the reader reports.
+    fn cursor_cli_messages(
+        root: &Path,
+        prompts: &[Value],
+        typed: &str,
+    ) -> Vec<(EventKind, String)> {
+        let session = SessionRef::new(Provider::CursorCli, uuid::Uuid::new_v4().to_string());
+        let directory = root.join("bucket").join(&session.id);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("meta.json"), "{}").unwrap();
+        let database = rusqlite::Connection::open(directory.join("store.db")).unwrap();
+        database
+            .execute_batch(
+                "PRAGMA user_version = 1;
+                 CREATE TABLE blobs (id TEXT PRIMARY KEY, data BLOB);
+                 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);",
+            )
+            .unwrap();
+        let blob = |data: Vec<u8>| {
+            let id = Sha256::digest(&data).to_vec();
+            database
+                .execute(
+                    "INSERT INTO blobs VALUES (?1, ?2)",
+                    rusqlite::params![hex::encode(&id), data],
+                )
+                .unwrap();
+            id
+        };
+        let user_message = blob(
+            CursorUserMessage {
+                text: typed.to_owned(),
+                ..CursorUserMessage::default()
+            }
+            .encode_to_vec(),
+        );
+        let step = blob(
+            CursorConversationStep {
+                message: Some(cursor_conversation_step::Message::Assistant(
+                    CursorAssistantMessage {
+                        text: "Answer".to_owned(),
+                    },
+                )),
+            }
+            .encode_to_vec(),
+        );
+        let turn = blob(
+            CursorConversationTurnStructure {
+                turn: Some(cursor_conversation_turn_structure::Turn::Agent(
+                    CursorAgentConversationTurnStructure {
+                        user_message,
+                        steps: vec![step],
+                    },
+                )),
+            }
+            .encode_to_vec(),
+        );
+        let state = blob(
+            CursorConversationStateStructure {
+                root_prompt_messages_json: prompts
+                    .iter()
+                    .map(|prompt| blob(prompt.to_string().into_bytes()))
+                    .collect(),
+                turns: vec![turn],
+            }
+            .encode_to_vec(),
+        );
+        let root_metadata = json!({"latestRootBlobId": hex::encode(state)}).to_string();
+        database
+            .execute(
+                "INSERT INTO meta VALUES ('0', ?1)",
+                [hex::encode(root_metadata)],
+            )
+            .unwrap();
+        drop(database);
+        CursorCliAdapter::with_root(root)
+            .read_session(&session)
+            .unwrap()
+            .events
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event.kind,
+                    EventKind::MessageUser | EventKind::MessageAssistant
+                )
+            })
+            .map(|event| {
+                let text = event.payload["text"].as_str().unwrap().to_owned();
+                (event.kind, text)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cursor_cli_reads_the_typed_text_instead_of_the_prompt_envelope() {
+        let root = tempfile::tempdir().unwrap();
+        let typed = "Question\n\nwith a <user_query> mention";
+        let wrapped = format!(
+            "<timestamp>Monday, Jan 5, 2026</timestamp>\n<user_query>\n{typed}\n</user_query>"
+        );
+        let context = "<user_info>\nOS: synthetic\n</user_info>\n\n<rules>\nRule\n</rules>";
+        let prompts = |query: &str| {
+            [
+                json!({"role": "system", "content": "System"}),
+                json!({"role": "user", "content": context}),
+                json!({"role": "user", "content": [{"type": "text", "text": query}]}),
+                json!({"role": "assistant", "content": [{"type": "text", "text": "Answer"}]}),
+            ]
+        };
+        let answer = (EventKind::MessageAssistant, "Answer".to_owned());
+        assert_eq!(
+            cursor_cli_messages(root.path(), &prompts(&wrapped), typed),
+            [(EventKind::MessageUser, typed.to_owned()), answer.clone()]
+        );
+        // A turn that keeps the envelope holds it as conversation text.
+        assert_eq!(
+            cursor_cli_messages(root.path(), &prompts(&wrapped), &wrapped),
+            [(EventKind::MessageUser, wrapped.clone()), answer]
+        );
+        assert_eq!(
+            cursor_cli_messages(root.path(), &prompts(context)[2..], context)[0],
+            (EventKind::MessageUser, context.to_owned())
+        );
+    }
 
     #[test]
     fn cursor_cli_metadata_parses_millisecond_timestamp_fields() {
@@ -423,8 +556,9 @@ fn cursor_events(root: &Path, database: &Path) -> Result<Vec<CursorEvent>> {
         bail!("Cursor CLI session exceeds safe turn limit");
     }
 
-    let prompt_events = cursor_prompt_events(connection, &state.root_prompt_messages_json)?;
+    let mut prompt_events = cursor_prompt_events(connection, &state.root_prompt_messages_json)?;
     let structural_events = cursor_structural_events(connection, state.turns)?;
+    unwrap_cursor_user_prompts(&mut prompt_events, &structural_events);
     if prompt_events.iter().any(|event| {
         matches!(
             event.kind,
@@ -591,6 +725,41 @@ fn cursor_prompt_events(
         }
     }
     Ok(events)
+}
+
+/// Cursor wraps the typed text before it sends a prompt, and sends the workspace context as a
+/// separate user prompt. The turns keep the typed text, so they identify the wrapped prompts.
+fn unwrap_cursor_user_prompts(prompts: &mut [CursorEvent], turns: &[CursorEvent]) {
+    let typed = turns
+        .iter()
+        .filter(|event| event.kind == EventKind::MessageUser)
+        .filter_map(|event| event.payload["text"].as_str())
+        .collect::<BTreeSet<_>>();
+    for event in prompts
+        .iter_mut()
+        .filter(|event| event.kind == EventKind::MessageUser)
+    {
+        let Some(text) = event.payload["text"]
+            .as_str()
+            .filter(|text| !typed.contains(text))
+        else {
+            continue;
+        };
+        let query = text
+            .split_once("<user_query>\n")
+            .and_then(|(_, query)| query.strip_suffix("\n</user_query>"))
+            .filter(|query| typed.contains(query));
+        if let Some(query) = query {
+            event.payload = json!({ "text": query });
+        } else if text.starts_with("<user_info>\n") {
+            *event = CursorEvent {
+                kind: EventKind::ProviderEvent,
+                payload: json!({ "kind": "cursor_context_message", "detail": "omitted" }),
+                replay_policy: ReplayPolicy::HistoricalOnly,
+                raw_type: "cursor.prompt.context",
+            };
+        }
+    }
 }
 
 fn prompt_content(envelope: &Value) -> impl Iterator<Item = &Value> {
@@ -1444,11 +1613,12 @@ fn cursor_disk_record(transaction: &Transaction<'_>, key: &str) -> Result<Cursor
 fn cursor_disk_value_length(transaction: &Transaction<'_>, key: &str) -> Result<Option<i64>> {
     transaction
         .query_row(
-            "SELECT length(value) FROM cursorDiskKV WHERE key = ?1",
+            "SELECT octet_length(value) FROM cursorDiskKV WHERE key = ?1",
             [key],
-            |row| row.get(0),
+            |row| row.get::<_, Option<i64>>(0),
         )
         .optional()
+        .map(Option::flatten)
         .map_err(Into::into)
 }
 

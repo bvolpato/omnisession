@@ -385,3 +385,85 @@ fn invalid_binary_overrides_mean_not_installed_without_path_fallback() {
         .collect::<Vec<_>>();
     assert!(ran.is_empty(), "provider binaries ran: {ran:?}");
 }
+
+#[cfg(unix)]
+#[test]
+fn path_lookup_matches_the_command_line_for_unusual_entries() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    if !in_child() {
+        run_in_synthetic_home(
+            "path_lookup_matches_the_command_line_for_unusual_entries",
+            "unusual-path",
+            |root, bin| {
+                let markers = root.join("markers");
+                fs::create_dir_all(&markers).expect("marker directory");
+                let blocked = root.join("blocked");
+                fs::create_dir_all(&blocked).expect("non-executable directory");
+                for name in ["opencode", "hermes"] {
+                    fs::write(blocked.join(name), "#!/bin/sh\n").expect("non-executable file");
+                    fs::set_permissions(blocked.join(name), fs::Permissions::from_mode(0o644))
+                        .expect("non-executable permissions");
+                }
+                symlink("pi", blocked.join("pi")).expect("symlink loop");
+                // An alias that an older release installed, reached through a link elsewhere.
+                let shim = root.join(".omnisession/shims/omp");
+                write_fake_binary(&shim, &markers.join("shim"), "exit 0");
+                symlink(&shim, blocked.join("omp")).expect("linked alias");
+                symlink(
+                    env::current_exe().expect("test executable"),
+                    blocked.join("grok"),
+                )
+                .expect("link to the running executable");
+                write_fake_binary(
+                    &root.join("relative/opencode"),
+                    &markers.join("opencode"),
+                    r#"printf '[{"id":"ses_relative","directory":"%s"}]' "$PWD""#,
+                );
+                for name in ["hermes", "pi", "omp", "grok"] {
+                    write_fake_binary(&bin.join(name), &markers.join(name), "exit 0");
+                }
+                let path = env::join_paths([&blocked, &PathBuf::from("relative"), bin])
+                    .expect("synthetic PATH");
+                vec![("PATH", PathBuf::from(path))]
+            },
+        );
+        return;
+    }
+
+    let home = fs::canonicalize(env::var_os("HOME").expect("synthetic HOME")).expect("home");
+    let project = home.join("project");
+    fs::create_dir_all(&project).expect("project directory");
+    env::set_current_dir(&home).expect("enter the synthetic home");
+    let registry = AdapterRegistry::with_local_adapters();
+    for (provider, name) in [
+        (Provider::Hermes, "hermes"),
+        (Provider::Pi, "pi"),
+        (Provider::OhMyPi, "omp"),
+        (Provider::Grok, "grok"),
+    ] {
+        let executable = registry
+            .adapter(provider)
+            .expect("registered adapter")
+            .probe()
+            .executable
+            .expect("executable on PATH");
+        assert_eq!(
+            fs::canonicalize(executable).expect("executable"),
+            home.join("bin").join(name),
+            "{provider}"
+        );
+    }
+    // A relative entry names a file below this process's directory, not below the project that
+    // OpenCode runs in.
+    let sessions = registry
+        .list_sessions(Provider::OpenCode, Some(&project))
+        .expect("OpenCode listing");
+    assert_eq!(
+        sessions
+            .iter()
+            .map(|session| session.session.id.as_str())
+            .collect::<Vec<_>>(),
+        ["ses_relative"]
+    );
+}

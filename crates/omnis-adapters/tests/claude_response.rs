@@ -6469,3 +6469,79 @@ fn a_repaired_reply_cannot_promote_its_older_follow_up() {
         &["Older follow-up"],
     );
 }
+
+#[test]
+fn an_oversized_record_keeps_the_conversation_before_and_after_it() {
+    let mut pasted = message(3, 2, "user", json!("x".repeat(17 * 1024 * 1024)));
+    pasted["isSidechain"] = json!(false);
+    let mut worker = pasted.clone();
+    worker["uuid"] = json!(Uuid::from_u128(4));
+    worker["isSidechain"] = json!(true);
+    let snapshot = read(&[
+        message(1, 0, "user", json!("First request")),
+        message(2, 1, "assistant", json!("First reply")),
+        pasted,
+        worker,
+        message(5, 3, "assistant", json!("Reply to the oversized request")),
+        message(6, 5, "user", json!("Last request")),
+    ]);
+    let texts: Vec<_> = snapshot
+        .events
+        .iter()
+        .filter_map(|event| event.payload["text"].as_str())
+        .collect();
+    assert_eq!(
+        texts,
+        [
+            "First request",
+            "First reply",
+            "Reply to the oversized request",
+            "Last request"
+        ]
+    );
+    let notices: Vec<_> = snapshot
+        .events
+        .iter()
+        .filter(|event| event.kind == EventKind::ProviderEvent)
+        .map(|event| {
+            (
+                event.source.raw_record_type.as_deref(),
+                event.payload["omitted_records"].as_u64(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        notices,
+        [(Some("omnisession.record_size_limit"), Some(2))],
+        "the omission stays reported and no parent is missing"
+    );
+}
+
+#[test]
+fn a_reused_summary_uuid_cannot_select_the_same_events_twice() {
+    let hidden = meta_user(2, 1);
+    let reply = message(3, 2, "assistant", json!([call("a"), text_block("Reply")]));
+    let mut summary = message(1, 3, "user", json!([]));
+    summary["isCompactSummary"] = json!(true);
+    let rows = [
+        json!({"uuid": Uuid::from_u128(1)}),
+        hidden.clone(),
+        reply.clone(),
+        summary,
+        hidden,
+        reply,
+    ];
+    for preview in [false, true] {
+        let snapshot = read_session(&rows, preview);
+        let replies = snapshot
+            .events
+            .iter()
+            .filter(|event| event.payload["text"] == "Reply")
+            .count();
+        assert_eq!(replies, 1);
+    }
+}
+
+fn text_block(text: &str) -> Value {
+    json!({"type":"text","text":text})
+}

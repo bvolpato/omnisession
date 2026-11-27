@@ -380,7 +380,8 @@ fn validate_deletion_metadata(
         || object.get("createdAtMs").and_then(Value::as_i64).is_none()
         || object.get("updatedAtMs").and_then(Value::as_i64).is_none()
         || !object.get("hasConversation").is_some_and(Value::is_boolean)
-        || !object.get("title").is_some_and(Value::is_string)
+        // Cursor Agent omits the title until it names the conversation.
+        || !object.get("title").is_none_or(Value::is_string)
     {
         bail!("Cursor Agent session metadata schema is not verified");
     }
@@ -1245,6 +1246,35 @@ mod tests {
                     .to_string_lossy()
                     .starts_with(".omnisession-delete-"))
         );
+    }
+
+    #[test]
+    fn deletes_a_cursor_session_that_has_no_title() {
+        let temporary = tempfile::tempdir().expect("temporary Cursor root");
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir(&workspace).expect("workspace");
+        let snapshot = fixture_snapshot(&workspace);
+        let chats = temporary.path().join("cursor/chats");
+        let selected =
+            build_with_root(&snapshot, &workspace, chats.clone()).expect("selected import");
+        materialize_store(&selected).expect("materialize selected");
+        let path = selected.target_dir.join("meta.json");
+        let mut metadata: Value =
+            serde_json::from_slice(&fs::read(&path).expect("metadata")).expect("metadata JSON");
+        let write = |metadata: &Value| fs::write(&path, metadata.to_string()).expect("metadata");
+
+        metadata["title"] = json!(7);
+        write(&metadata);
+        assert!(delete_session_at(&selected.target, &path, &chats).is_err());
+        assert!(selected.target_dir.exists());
+
+        metadata
+            .as_object_mut()
+            .expect("metadata object")
+            .remove("title");
+        write(&metadata);
+        delete_session_at(&selected.target, &path, &chats).expect("delete untitled session");
+        assert!(!selected.target_dir.exists());
     }
 
     #[test]

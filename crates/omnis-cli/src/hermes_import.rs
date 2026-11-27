@@ -301,11 +301,35 @@ pub fn materialize(import: &HermesImport, binary: &Path) -> Result<()> {
         "title": import.title,
         "messages": messages,
     }]);
-    let result = run_provider_import(binary, &import.root, &serde_json::to_vec(&payload)?)?;
+    let payload = serde_json::to_vec(&payload)?;
+    let result = run_provider_import(binary, &import.root, &payload)
+        .map_err(|error| remove_committed_session(import, binary, error))?;
     if let Err(error) = finish_provider_import(import, &result) {
         return Err(combine_rollback_error(error, rollback(import, binary)));
     }
     Ok(())
+}
+
+/// An importer can commit the session and then fail, or reach its deadline before it reports.
+fn remove_committed_session(
+    import: &HermesImport,
+    binary: &Path,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    let Ok(committed) = HermesAdapter::with_root(&import.root).read_session(&import.target) else {
+        return error;
+    };
+    // Hermes numbers a repeated title, and the failed importer did not report the result.
+    let numbered = import
+        .title
+        .as_deref()
+        .zip(committed.title.as_deref())
+        .and_then(|(base, title)| title.strip_prefix(base)?.strip_prefix(" #"))
+        .is_some_and(|number| number.parse::<u64>().is_ok());
+    if numbered {
+        let _ = import.resolved_title.set(committed.title);
+    }
+    combine_rollback_error(error, rollback(import, binary))
 }
 
 fn finish_provider_import(import: &HermesImport, result: &serde_json::Value) -> Result<()> {
@@ -933,7 +957,9 @@ fn python_interpreter(binary: &Path) -> Result<(PathBuf, Vec<String>)> {
 }
 
 fn resolve_hermes_runtime(binary: &Path) -> Result<HermesRuntime> {
-    resolve_launcher(binary, 0, &mut Vec::new())
+    let canonical = fs::canonicalize(binary)
+        .with_context(|| format!("canonicalizing Hermes launcher `{}`", binary.display()))?;
+    resolve_launcher(&canonical, 0, &mut Vec::new())
 }
 
 fn resolve_launcher(
@@ -1241,6 +1267,95 @@ mod tests {
             HermesAdapter::with_root(temporary.path())
                 .read_session(&import.target)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn messages_that_look_like_json_round_trip() {
+        let temporary = tempfile::tempdir().expect("Hermes import root");
+        fixture(temporary.path());
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir(&workspace).expect("workspace");
+        let mut source = snapshot(&workspace, Provider::Claude, "source");
+        source.events[0].payload["text"] = json!(r#"["alpha", "beta"]"#);
+        source.events[1].payload["text"] =
+            json!(r#"[{"type": "text", "text": "typed"}, {"type": "text", "text": "parts"}]"#);
+        let import = build_with_root(&source, &workspace, temporary.path().to_path_buf())
+            .expect("Hermes import");
+
+        materialize_store(&import).expect("materialize Hermes import");
+
+        rollback_store(&import).expect("Hermes rollback");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_importer_that_fails_after_its_commit_is_rolled_back() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().expect("Hermes import root");
+        let root = temporary.path().join("home");
+        fixture(&root);
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir(&workspace).expect("workspace");
+        let source = snapshot(&workspace, Provider::Claude, "source");
+        let import = build_with_root(&source, &workspace, root.clone()).expect("Hermes import");
+        let database = root.join("state.db");
+        let empty = temporary.path().join("empty.db");
+        fs::copy(&database, &empty).expect("empty database");
+        materialize_store(&import).expect("imported session");
+        let committed = temporary.path().join("committed.db");
+        fs::rename(&database, &committed).expect("committed database");
+        fs::copy(&empty, &database).expect("restored database");
+
+        // Stands in for Python: the version probe, the importer, and then `hermes sessions delete`.
+        let python = temporary.path().join("venv/bin/python3");
+        let script = temporary.path().join("hermes");
+        let launcher = temporary.path().join("bin/hermes");
+        for (path, contents) in [
+            (
+                &python,
+                format!(
+                    "#!/bin/sh\ncase \"$1\" in\n\
+                     -I) printf '{MINIMUM_HERMES_VERSION}\\n{HERMES_CONSOLE_ENTRY_POINT}\\n/scripts\\n' ;;\n\
+                     -c) cat > /dev/null; cp '{committed}' '{database}'; echo 'disk full' >&2; exit 1 ;;\n\
+                     *) cp '{empty}' '{database}' ;;\n\
+                     esac\n",
+                    committed = committed.display(),
+                    database = database.display(),
+                    empty = empty.display(),
+                ),
+            ),
+            (
+                &script,
+                "from hermes_cli.main import main\nif __name__ == '__main__':\n    main()\n"
+                    .to_owned(),
+            ),
+            (
+                &launcher,
+                format!(
+                    "#!/usr/bin/env bash\nunset PYTHONPATH\nunset PYTHONHOME\nexec \"{}\" \"{}\" \"$@\"\n",
+                    python.display(),
+                    script.display()
+                ),
+            ),
+        ] {
+            fs::create_dir_all(path.parent().expect("program directory"))
+                .expect("program directory");
+            fs::write(path, contents).expect("fake program");
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("executable");
+        }
+
+        let error = materialize(&import, &launcher).expect_err("importer failure");
+
+        assert!(format!("{error:#}").contains("disk full"), "{error:#}");
+        assert!(!crate::rollback_failed(&error), "{error:#}");
+        assert!(
+            HermesAdapter::with_root(&root)
+                .find_native_session(&import.target.id)
+                .expect("Hermes lookup")
+                .is_none(),
+            "the failed import left its session behind"
         );
     }
 

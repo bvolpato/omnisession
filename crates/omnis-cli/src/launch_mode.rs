@@ -593,7 +593,11 @@ fn invocation_identity(command: &Command, profiled: bool) -> Option<String> {
     let mut digest = Sha256::new();
     hash_value(&mut digest, b'B', OsStr::new(env!("CARGO_PKG_VERSION")));
     let program = Path::new(command.get_program());
-    stamp_executable(&mut digest, program)?;
+    let canonical = fs::canonicalize(program).ok()?;
+    if !crate::version_gate::is_named_install(program, &canonical) {
+        return None;
+    }
+    stamp_executable(&mut digest, &canonical)?;
     let cwd = command
         .get_current_dir()
         .map_or_else(|| env::current_dir().ok(), |path| Some(path.to_owned()))?;
@@ -760,6 +764,31 @@ fn help_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn help_results_of_a_dispatcher_are_not_reused() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let identity = |target: &str, link: &str| {
+            let target = directory.path().join(target);
+            fs::write(&target, b"\x7fELFfake-binary").expect("write binary");
+            let link = directory.path().join(link);
+            std::os::unix::fs::symlink(target, &link).expect("link binary");
+            invocation_identity(&Command::new(link), false)
+        };
+
+        // The file of a dispatcher stays the same when the program that it selects is upgraded.
+        assert_eq!(identity("mise", "claude"), None);
+        assert!(identity("2.1.220", "claude-code").is_some());
+        assert!(identity("grok-0.2.117", "grok").is_some());
+
+        // A `#!` dispatcher symlink must not be cached or collide across provider names either.
+        let shim = directory.path().join("dispatch.sh");
+        fs::write(&shim, b"#!/bin/sh\necho help\n").expect("write dispatcher script");
+        let link = directory.path().join("codex");
+        std::os::unix::fs::symlink(&shim, &link).expect("link dispatcher script");
+        assert_eq!(invocation_identity(&Command::new(link), false), None);
+    }
 
     #[test]
     fn omp_defaults_to_no_flags_and_auto_approve_is_not_a_safer_mode() {

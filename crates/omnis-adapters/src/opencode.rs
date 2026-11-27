@@ -238,14 +238,25 @@ pub fn is_opencode_v2(binary: &Path) -> bool {
     opencode_major_version(output).is_some_and(|major| major >= 2)
 }
 
+/// Major version on the first line that reports one. A launcher can print a notice before it.
 fn opencode_major_version(output: &str) -> Option<u64> {
-    let trimmed = output.trim();
-    let version_str = trimmed.strip_prefix("opencode").unwrap_or(trimmed).trim();
-    let version_str = version_str.strip_prefix('v').unwrap_or(version_str).trim();
-    version_str
-        .split('.')
-        .next()
-        .and_then(|major| major.parse::<u64>().ok())
+    output.lines().find_map(|line| {
+        let trimmed = line.trim();
+        let version_str = trimmed.strip_prefix("opencode").unwrap_or(trimmed).trim();
+        let version_str = version_str.strip_prefix('v').unwrap_or(version_str).trim();
+        let (major, rest) = version_str.split_once('.')?;
+        let minor_len = rest.bytes().take_while(u8::is_ascii_digit).count();
+        if minor_len == 0 {
+            return None;
+        }
+        if !matches!(
+            rest.as_bytes().get(minor_len),
+            None | Some(b'.' | b'-' | b'+' | b' ' | b'\t')
+        ) {
+            return None;
+        }
+        major.parse::<u64>().ok()
+    })
 }
 
 /// The command-line interface used by one `OpenCode` operation.
@@ -1261,6 +1272,23 @@ mod tests {
     use super::{parse_command_json, push_export_events};
     use crate::support::EventBuilder;
     use omnis_ir::{EventKind, Provider, ReplayPolicy, SessionRef};
+
+    #[test]
+    fn version_detection_reads_past_a_launcher_banner() {
+        for (output, major) in [
+            ("1.17.20\n", Some(1)),
+            ("opencode v2.0.1\n", Some(2)),
+            ("2.1.0-beta.1\nUpdate available\n", Some(2)),
+            ("Now using node v22.3.0 (npm v10.8.1)\n2.2.0\n", Some(2)),
+            ("1. Activating environment...\n2.2.0\n", Some(2)),
+            ("42\n2.2.0\n", Some(2)),
+            ("1. Activating environment...\n", None),
+            ("42\n", None),
+            ("unknown\n", None),
+        ] {
+            assert_eq!(super::opencode_major_version(output), major, "{output}");
+        }
+    }
 
     #[test]
     fn global_listing_fills_the_limit_after_archived_and_overlapping_pages() {

@@ -212,6 +212,51 @@ fn an_unstamped_model_result_before_a_new_generated_turn_rolls_back_with_its_dis
     }
 }
 
+#[test]
+fn script_display_records_do_not_evict_model_tool_records() {
+    let scripts = 600;
+    let mut rows = vec![
+        event("task_started", json!({"turn_id":"turn"})),
+        page_user("turn", "request", "run the scripts"),
+    ];
+    for script in 0..scripts {
+        let call_id = format!("script-{script}");
+        rows.push(json!({"type":"response_item","payload":{"type":"custom_tool_call","call_id":call_id,
+            "name":"exec","input":"run()","internal_chat_message_metadata_passthrough":{"turn_id":"turn"}}}));
+        for step in 0..2 {
+            let mut display = command("turn", "completed");
+            display["payload"]["item"]["id"] = format!("exec-{script}-{step}").into();
+            rows.push(display);
+        }
+        rows.push(json!({"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":call_id,
+            "output":[{"type":"input_text","text":"done"}],"internal_chat_message_metadata_passthrough":{"turn_id":"turn"}}}));
+    }
+    for mode in [None, Some("paginated")] {
+        let snapshot = read_with_history_mode(rows.clone(), false, mode).unwrap();
+        let retained: Vec<_> = snapshot
+            .events
+            .iter()
+            .filter(|e| e.payload["call_id"].is_string())
+            .collect();
+        assert_eq!(retained.len(), 1_024, "{mode:?}");
+        assert_eq!(
+            retained[0].payload["call_id"],
+            format!("script-{}", scripts - 512)
+        );
+        let displays: Vec<_> = snapshot
+            .events
+            .iter()
+            .filter(|e| e.kind == EventKind::CommandExecuted)
+            .collect();
+        assert_eq!(displays.len(), 1_024, "{mode:?}");
+        assert!(displays[0].sequence > retained[0].sequence);
+        // An import leaves out the displays of a completed script.
+        let import = omnis_core::import_trajectory(&snapshot);
+        assert_eq!(import.tool_events, 1_024, "{mode:?}");
+        assert!(import.truncated);
+    }
+}
+
 fn exec_call(turn: Option<&str>, command: &str) -> Value {
     let mut record = call(turn);
     record["payload"]["name"] = "exec_command".into();

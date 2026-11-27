@@ -822,8 +822,11 @@ fn validated_provider_command(
     current_exe: &Path,
 ) -> Result<PathBuf> {
     let executable = validate_real_binary(invocation, excluded_directory, current_exe)?;
-    // A Codex dispatcher can select its command from the name used to invoke it.
-    if provider == Provider::Codex {
+    // A dispatcher, such as a mise or Volta shim, selects its command from the name used to invoke
+    // it. Cursor Agent is identified by the name of the resolved file instead.
+    if provider == Provider::Codex
+        || (provider != Provider::CursorCli && !same_invocation_name(invocation, &executable))
+    {
         Ok(std::path::absolute(invocation)?)
     } else {
         Ok(executable)
@@ -1126,6 +1129,45 @@ mod tests {
     #[cfg(unix)]
     fn shell_quote(path: &Path) -> String {
         format!("'{}'", path.to_string_lossy().replace('\'', "'\"'\"'"))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dispatcher_keeps_the_name_that_selects_its_command() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().expect("temporary installation");
+        let root = temporary.path().canonicalize().expect("installation root");
+        let dispatcher = root.join("dispatcher");
+        write_executable(&dispatcher, "#!/bin/sh\nprintf '%s' \"${0##*/}\"\n");
+        let current_exe = root.join("omni");
+        write_executable(&current_exe, "#!/bin/sh\nexit 0\n");
+        let excluded = root.join("shims");
+        fs::create_dir(&excluded).expect("legacy aliases");
+        let bin = root.join("bin");
+        fs::create_dir(&bin).expect("binary directory");
+        let command = |provider, link: &str, target: &Path| {
+            symlink(target, bin.join(link)).expect("link command");
+            validated_provider_command(provider, &bin.join(link), &excluded, &current_exe)
+        };
+
+        let pi = command(Provider::Pi, "pi", &dispatcher).expect("dispatched Pi");
+        let output = std::process::Command::new(&pi).output().expect("run Pi");
+        assert_eq!(output.stdout, b"pi");
+
+        let versioned = root.join("opencode");
+        write_executable(&versioned, "#!/bin/sh\nexit 0\n");
+        assert_eq!(
+            command(Provider::OpenCode, "opencode", &versioned).expect("same name"),
+            versioned
+        );
+        let cursor = root.join("cursor-agent");
+        write_executable(&cursor, "#!/bin/sh\nexit 0\n");
+        assert_eq!(
+            command(Provider::CursorCli, "agent", &cursor).expect("Cursor Agent"),
+            cursor
+        );
+        assert!(command(Provider::Grok, "grok", &current_exe).is_err());
     }
 
     #[cfg(windows)]

@@ -1,4 +1,7 @@
-use super::{event, message, page_user, read_with_history_mode, turn_item, visible_text};
+use super::{
+    CodexAdapter, Provider, ProviderAdapter, SESSION_ID, SessionRef, event, message, page_user,
+    read_with_history_mode, turn_item, visible_text,
+};
 use serde_json::{Value, json};
 
 use super::published_text;
@@ -72,6 +75,54 @@ fn over_budget_paginated_previews_keep_independent_public_edges() {
     let edited = read_with_history_mode(records, true, Some("paginated")).unwrap();
     assert!(!visible_text(&edited).contains(&"opening request"));
     assert!(omnis_core::import_trajectory(&edited).truncated);
+}
+
+#[test]
+fn an_over_budget_rollout_with_tools_indexes_both_edges_of_the_conversation() {
+    let home = tempfile::tempdir().unwrap();
+    let sessions = home.path().join("sessions");
+    std::fs::create_dir(&sessions).unwrap();
+    let mut records = vec![
+        json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":home.path(),"history_mode":"paginated"}}),
+        page_user("first", "open", "opening request"),
+        page_user("first", "steer", "provisional request"),
+    ];
+    let output = "o".repeat(64 * 1024);
+    for i in 0..200 {
+        let call_id = format!("call-{i}");
+        records.extend([
+            json!({"type":"response_item","payload":{"type":"function_call","call_id":call_id,
+                "name":"example","arguments":"{}"}}),
+            json!({"type":"response_item","payload":{"type":"function_call_output","call_id":call_id,"output":output}}),
+        ]);
+    }
+    records.extend([
+        page_user("first", "steer", "revised request"),
+        page_user("last", "closed", "final request"),
+    ]);
+    let mut document = String::new();
+    for (ordinal, record) in records.iter_mut().enumerate() {
+        record["timestamp"] = "2026-01-05T09:00:00.000Z".into();
+        record["ordinal"] = ordinal.into();
+        document.push_str(&record.to_string());
+        document.push('\n');
+    }
+    std::fs::write(
+        sessions.join(format!("rollout-{SESSION_ID}.jsonl")),
+        document,
+    )
+    .unwrap();
+    let adapter = CodexAdapter::with_root(home.path());
+    let session = SessionRef::new(Provider::Codex, SESSION_ID);
+    let wanted = ["opening request", "revised request", "final request"];
+    assert_eq!(
+        visible_text(&adapter.read_session(&session).unwrap()),
+        wanted
+    );
+    let read = adapter.index_session(&session, None, 1024 * 1024).unwrap();
+    assert!(!read.source_complete);
+    assert_eq!(visible_text(&read.snapshot), wanted);
+    assert_eq!(read.snapshot.workspace.current_dir, home.path());
 }
 
 #[test]

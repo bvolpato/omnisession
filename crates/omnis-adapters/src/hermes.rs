@@ -2,7 +2,7 @@ use std::{
     collections::HashSet,
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, SystemTime},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -110,8 +110,9 @@ impl HermesAdapter {
             let mut builder = EventBuilder::new(Provider::Hermes, &session.id);
             builder.set_provider_version(Some(format!("schema-{}", schema_version(connection)?)));
             push_session_metadata(&mut builder, &metadata);
+            let imported = metadata.omnisession_source.is_some();
             for message in &messages {
-                push_message(&mut builder, message);
+                push_message(&mut builder, message, imported);
             }
             Ok(IndexRead {
                 ancestor_revisions: Vec::new(),
@@ -202,7 +203,7 @@ impl HermesAdapter {
                         metadata
                             .first_user_message
                             .as_deref()
-                            .and_then(content_text)
+                            .and_then(|content| content_text(content, false))
                     })
                     .map(|title| one_line(&title, 200));
                 sessions.push(NativeSession {
@@ -473,9 +474,12 @@ fn imported_lineage(
     (source, branched_from)
 }
 
-fn push_message(builder: &mut EventBuilder, message: &MessageRow) {
+fn push_message(builder: &mut EventBuilder, message: &MessageRow, imported: bool) {
     let timestamp = timestamp(message.timestamp);
-    let text = message.content.as_deref().and_then(content_text);
+    let text = message
+        .content
+        .as_deref()
+        .and_then(|content| content_text(content, imported));
     if text.is_none()
         && matches!(message.role.as_str(), "user" | "assistant")
         && let Some(structured) = message.content.as_deref().and_then(decode_content)
@@ -594,7 +598,8 @@ fn tool_output(content: &str) -> Value {
     decode_content(content).unwrap_or_else(|| Value::String(content.to_owned()))
 }
 
-fn content_text(content: &str) -> Option<String> {
+/// Visible text of stored content. `plain` content was written as text, even when it is JSON.
+fn content_text(content: &str, plain: bool) -> Option<String> {
     if let Some(structured) = decode_content(content) {
         // Image-only content keeps a placeholder so the turn is not lost.
         return flattened_text(&structured).or_else(|| {
@@ -611,15 +616,37 @@ fn content_text(content: &str) -> Option<String> {
             (images > 0).then(|| omitted_images_text(images))
         });
     }
-    let trimmed = content.trim();
-    if trimmed.is_empty() {
+    if content.trim().is_empty() {
         return None;
     }
-    let Some(value) = parse_json(trimmed) else {
-        return Some(content.to_owned());
-    };
-    // Typed text that merely looks like JSON stays as typed.
-    flattened_text(&value).or_else(|| Some(content.to_owned()))
+    // Content parts can also be stored without the marker. Typed text that merely looks like JSON
+    // stays as typed.
+    (!plain)
+        .then(|| parse_json(content))
+        .flatten()
+        .filter(is_content_parts)
+        .and_then(|value| flattened_text(&value))
+        .or_else(|| Some(content.to_owned()))
+}
+
+fn is_content_parts(value: &Value) -> bool {
+    value.as_array().is_some_and(|parts| {
+        parts.iter().all(|part| {
+            matches!(
+                part.get("type").and_then(Value::as_str),
+                Some(
+                    "text"
+                        | "input_text"
+                        | "output_text"
+                        | "image"
+                        | "image_url"
+                        | "input_image"
+                        | "audio"
+                        | "input_audio"
+                )
+            )
+        })
+    })
 }
 
 /// Visible text of structured content, like Hermes's `flatten_message_text`.
@@ -661,9 +688,10 @@ fn parse_json(value: &str) -> Option<Value> {
 
 fn timestamp(value: f64) -> Option<DateTime<Utc>> {
     let duration = Duration::try_from_secs_f64(value).ok()?;
-    Some(DateTime::from(
-        SystemTime::UNIX_EPOCH.checked_add(duration)?,
-    ))
+    DateTime::from_timestamp(
+        i64::try_from(duration.as_secs()).ok()?,
+        duration.subsec_nanos(),
+    )
 }
 
 fn nonnegative(value: i64) -> u64 {

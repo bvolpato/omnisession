@@ -54,6 +54,15 @@ const MAX_BUILD_METADATA_SIZE: u64 = 4 * 1024 * 1024;
 const MAX_CURSOR_NATIVE_GRAPH_RECORDS: usize = 100_000;
 const MAX_CURSOR_NATIVE_RECORD_SIZE: usize = 16 * 1024 * 1024;
 const CURSOR_BLOB_PREFIX: &str = "agentKv:blob:";
+/// `cursorDiskKV` records that name their composer after the prefix.
+const CURSOR_NAMESPACED_PREFIXES: [&str; 6] = [
+    "bubbleId",
+    "checkpointId",
+    "codeBlockDiff",
+    "codeBlockPartialInlineDiffFates",
+    "composerConvHeaders",
+    "ofsContent",
+];
 const CURSOR_WORKSPACE_SELECTION_KEY: &str = "composer.composerData";
 const CURSOR_WORKSPACE_ITEM_TABLE_SCHEMA: &str =
     "CREATE TABLE ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB)";
@@ -967,9 +976,10 @@ fn cursor_deletion_roots(
     let mut roots = BTreeMap::new();
     for id in header_ids {
         let key = format!("composerData:{id}");
+        // A root without a value names no parent and no children.
         let Some(raw) = transaction
             .query_row(
-                "SELECT value FROM cursorDiskKV WHERE key = ?1",
+                "SELECT value FROM cursorDiskKV WHERE key = ?1 AND value IS NOT NULL",
                 [&key],
                 |row| cursor_record_bytes(row, 0),
             )
@@ -1033,13 +1043,7 @@ fn cursor_namespaced_key_prefix(prefix: &str, id: &str) -> String {
 fn delete_cursor_namespaced_records(transaction: &Transaction<'_>, id: &str) -> Result<()> {
     let root = format!("composerData:{id}");
     transaction.execute("DELETE FROM cursorDiskKV WHERE key = ?1", [&root])?;
-    for prefix in [
-        "bubbleId",
-        "checkpointId",
-        "codeBlockDiff",
-        "codeBlockPartialInlineDiffFates",
-        "ofsContent",
-    ] {
+    for prefix in CURSOR_NAMESPACED_PREFIXES {
         let prefix = cursor_namespaced_key_prefix(prefix, id);
         transaction.execute(
             "DELETE FROM cursorDiskKV
@@ -1215,13 +1219,8 @@ fn verify_cursor_deletion(database: &Path, ids: &BTreeSet<String>) -> Result<()>
     )?;
     connection.pragma_update(None, "query_only", "ON")?;
     for id in ids {
-        let patterns = [
-            cursor_namespaced_key_prefix("bubbleId", id),
-            cursor_namespaced_key_prefix("checkpointId", id),
-            cursor_namespaced_key_prefix("codeBlockDiff", id),
-            cursor_namespaced_key_prefix("codeBlockPartialInlineDiffFates", id),
-            cursor_namespaced_key_prefix("ofsContent", id),
-        ];
+        let patterns =
+            CURSOR_NAMESPACED_PREFIXES.map(|prefix| cursor_namespaced_key_prefix(prefix, id));
         let headers: i64 = connection.query_row(
             "SELECT COUNT(*) FROM composerHeaders WHERE composerId = ?1",
             [id],
@@ -1234,7 +1233,8 @@ fn verify_cursor_deletion(database: &Path, ids: &BTreeSet<String>) -> Result<()>
                 OR substr(key, 1, length(?3)) = ?3 COLLATE BINARY
                 OR substr(key, 1, length(?4)) = ?4 COLLATE BINARY
                 OR substr(key, 1, length(?5)) = ?5 COLLATE BINARY
-                OR substr(key, 1, length(?6)) = ?6 COLLATE BINARY",
+                OR substr(key, 1, length(?6)) = ?6 COLLATE BINARY
+                OR substr(key, 1, length(?7)) = ?7 COLLATE BINARY",
             params![
                 format!("composerData:{id}"),
                 &patterns[0],
@@ -1242,6 +1242,7 @@ fn verify_cursor_deletion(database: &Path, ids: &BTreeSet<String>) -> Result<()>
                 &patterns[2],
                 &patterns[3],
                 &patterns[4],
+                &patterns[5],
             ],
             |row| row.get(0),
         )?;
@@ -1675,7 +1676,7 @@ fn other_composer_blob_references(
 ) -> Result<Option<BTreeSet<String>>> {
     let mut statement = connection.prepare(
         "SELECT key, value FROM cursorDiskKV
-         WHERE key LIKE 'composerData:%' AND key <> ?1",
+         WHERE key LIKE 'composerData:%' AND key <> ?1 AND value IS NOT NULL",
     )?;
     let excluded_key = format!("composerData:{excluded_composer_id}");
     let mut rows = statement.query([excluded_key])?;
@@ -2541,6 +2542,70 @@ mod tests {
             )
             .expect("blob count");
         assert_eq!(blob_count_after, blob_count_before);
+    }
+
+    #[test]
+    fn deletion_removes_only_the_header_chunks_of_the_selected_composer() {
+        let fixture = fixture_store();
+        let snapshot = fixture_snapshot(&fixture.workspace);
+        let import = build_with_root(&snapshot, &fixture.workspace, fixture.root.clone())
+            .expect("build Cursor IDE import");
+        materialize_store(&import).expect("materialize Cursor IDE import");
+        let connection = Connection::open(&import.database).expect("global database");
+        let foreign = format!("composerConvHeaders:{}:000000", Uuid::new_v4());
+        for key in [
+            format!("composerConvHeaders:{}:000000", import.target.id),
+            format!("composerConvHeaders:{}:000001", import.target.id),
+            foreign.clone(),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO cursorDiskKV(key, value) VALUES (?1, '[]')",
+                    [&key],
+                )
+                .expect("header chunk");
+        }
+
+        delete_session_at(&import.target, &fixture.root).expect("delete selected composer");
+
+        let remaining = connection
+            .prepare("SELECT key FROM cursorDiskKV WHERE key LIKE 'composerConvHeaders:%'")
+            .expect("chunk query")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("chunk rows")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("chunk keys");
+        assert_eq!(remaining, [foreign]);
+    }
+
+    #[test]
+    fn a_null_composer_root_does_not_block_rollback_or_deletion() {
+        let fixture = fixture_store();
+        let snapshot = fixture_snapshot(&fixture.workspace);
+        let import = || {
+            build_with_root(&snapshot, &fixture.workspace, fixture.root.clone())
+                .expect("build Cursor IDE import")
+        };
+        let emptied = import();
+        materialize_store(&emptied).expect("materialize emptied composer");
+        Connection::open(&emptied.database)
+            .expect("global database")
+            .execute(
+                "UPDATE cursorDiskKV SET value = NULL WHERE key = ?1",
+                [format!("composerData:{}", emptied.target.id)],
+            )
+            .expect("empty composer root");
+
+        let rolled_back = import();
+        materialize_store(&rolled_back).expect("materialize rolled back composer");
+        rollback_store(&rolled_back).expect("roll back beside an empty composer root");
+        assert!(generated_rows_absent(&rolled_back).expect("rollback read-back"));
+
+        let deleted = import();
+        materialize_store(&deleted).expect("materialize deleted composer");
+        delete_session_at(&deleted.target, &fixture.root)
+            .expect("delete beside an empty composer root");
+        delete_session_at(&emptied.target, &fixture.root).expect("delete the empty composer");
     }
 
     #[test]

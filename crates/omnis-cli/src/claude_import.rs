@@ -554,7 +554,8 @@ fn verify_project_identity(project_dir: &Path, cwd: &str) -> Result<()> {
                     entry.path().display()
                 )
             })?;
-        if recorded_cwd != cwd {
+        // Claude records the workspace in NFC. The filesystem can report another normal form.
+        if recorded_cwd != cwd && !recorded_cwd.nfc().eq(cwd.nfc()) {
             bail!(
                 "Claude project key collision: existing transcript records `{recorded_cwd}`, target is `{cwd}`"
             );
@@ -978,6 +979,22 @@ mod tests {
                 .to_string()
                 .contains("cannot verify Claude project identity")
         );
+    }
+
+    #[test]
+    fn project_identity_accepts_another_unicode_form_of_the_workspace() {
+        let directory = tempfile::tempdir().expect("temporary project directory");
+        fs::write(
+            directory.path().join("existing.jsonl"),
+            json!({"type": "user", "cwd": "/workspace/caf\u{e9}"}).to_string(),
+        )
+        .expect("fixture transcript");
+
+        verify_project_identity(directory.path(), "/workspace/cafe\u{301}")
+            .expect("both forms name one Claude project");
+        let error = verify_project_identity(directory.path(), "/workspace/caf-")
+            .expect_err("another workspace with the same key must fail closed");
+        assert!(error.to_string().contains("project key collision"));
     }
 
     #[test]

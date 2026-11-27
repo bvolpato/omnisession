@@ -1141,6 +1141,44 @@ fn cursor_ide_reads_conversation_headers_from_chunks() {
 }
 
 #[test]
+fn cursor_ide_reads_a_conversation_with_null_checkpoint_and_diff_values() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let workspace = temporary.path().join("workspace");
+    let database = create_cursor_ide_fixture(temporary.path(), &workspace);
+    let connection = rusqlite::Connection::open(&database).expect("fixture database");
+    let adapter = CursorIdeAdapter::with_root(temporary.path());
+    let session = SessionRef::new(Provider::CursorIde, "root-composer");
+    let stored_bytes = |snapshot: &omnis_ir::CanonicalSnapshot| {
+        [EventKind::CheckpointCreated, EventKind::FilePatch].map(|kind| {
+            snapshot
+                .events
+                .iter()
+                .find(|event| event.kind == kind)
+                .expect("documentary record")
+                .payload["stored_bytes"]
+                .clone()
+        })
+    };
+    for (value, expected) in [(None, Value::Null), (Some("é"), serde_json::json!(2))] {
+        connection
+            .execute(
+                "UPDATE cursorDiskKV SET value = ?1 \
+                 WHERE key LIKE 'checkpointId:%' OR key LIKE 'codeBlockDiff:%'",
+                [value],
+            )
+            .expect("documentary values");
+        let snapshot = adapter
+            .read_session(&session)
+            .expect("conversation with an empty documentary record");
+        assert_eq!(snapshot.events[2].payload["text"], "Question");
+        assert_eq!(
+            stored_bytes(&snapshot),
+            [expected.clone(), expected.clone()]
+        );
+    }
+}
+
+#[test]
 fn cursor_ide_tool_bubbles_import_as_native_tool_records() {
     let temporary = TempDir::new().expect("temporary directory");
     let workspace = temporary.path().join("workspace");

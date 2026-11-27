@@ -73,14 +73,16 @@ impl ClaudeAdapter {
             return ClaudeFiles::default();
         };
         // Subagent logs, tool results, memory, and workflow artifacts outnumber transcripts, so skip them before the budgets apply.
+        // A project folder can have one of these names, because CLAUDE_CODE_PROJECT_DIR_NAME can set it.
         let (paths, limited) = nested_file_inventory(root, 8, &|path, is_dir| {
             if is_dir {
-                return path.file_name().is_none_or(|name| {
-                    !matches!(
-                        name.to_str(),
-                        Some("subagents" | "tool-results" | "memory" | "workflows")
-                    )
-                });
+                return path.parent() == Some(root)
+                    || path.file_name().is_none_or(|name| {
+                        !matches!(
+                            name.to_str(),
+                            Some("subagents" | "tool-results" | "memory" | "workflows")
+                        )
+                    });
             }
             path.extension()
                 .is_some_and(|extension| extension == "jsonl")

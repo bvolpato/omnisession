@@ -3258,6 +3258,7 @@ impl CodexSession {
     fn preview(
         self,
         session: &SessionRef,
+        reconstruct: bool,
     ) -> Result<(
         omnis_ir::CanonicalSnapshot,
         RollbackTitle,
@@ -3287,7 +3288,12 @@ impl CodexSession {
             )
         } else if self.history_mode == CodexHistoryMode::Paginated {
             let workspace = self.live_workspace()?;
-            (self.preview_paginated_events()?, workspace.directory, true)
+            let mut events = self.preview_paginated_events()?;
+            if reconstruct && paginated_preview::is_unavailable(&events) {
+                // A full pass verifies what the bounded preview could not.
+                (events, _, _) = self.reconstructed_preview(rollout_file::LIMITS)?;
+            }
+            (events, workspace.directory, true)
         } else if self.history_mode == CodexHistoryMode::Legacy {
             let scan = self.scan_workspace(true)?;
             if scan.reconstruct_history || contains_rollback_marker(&self.path)? {
@@ -3327,7 +3333,7 @@ impl CodexSession {
             let (snapshot, title) = self.read(session)?;
             (snapshot, title, CodexWorkspaceProjection::Unchecked)
         } else {
-            self.preview(session)?
+            self.preview(session, true)?
         };
         Ok(IndexRead {
             ownership_revision: None,
@@ -4570,7 +4576,7 @@ impl CodexHistory {
                 end,
             );
         }
-        self.paginated_inputs.segment();
+        self.paginated_inputs.segment(self.source_ordinal);
         self.paginated_workspace.new_segment(builder.checkpoint());
         self.paginated_answers.segment();
     }
@@ -4688,11 +4694,15 @@ impl CodexHistory {
             (self.workspace.path, self.workspace.record) = surviving.unzip();
         }
         self.paginated_answers.resolve_turns(aliases);
-        let replies = effective
+        let mut replies = effective
             .boundary
             .map_or_else(HashMap::new, |(ordinal, order)| {
                 self.paginated_answers.rollback(ordinal, order)
             });
+        if self.paginated_inputs.removes_segment(effective.boundary) {
+            // The requests decide which inherited replies survive.
+            replies.retain(|_, withdrawal| withdrawal.is_some());
+        }
         if owners.is_empty() && replies.is_empty() {
             return;
         }
@@ -8124,7 +8134,7 @@ impl ProviderAdapter for CodexAdapter {
         let (snapshot, workspace) = self.read_selected(native.clone(), |native, _| {
             let small_plain_rollout = !rollout_file::compressed(&native.path)
                 && fs::metadata(&native.path)?.len() <= MAX_PREVIEW_TAIL_SIZE;
-            let (mut snapshot, _, workspace) = native.preview(session)?;
+            let (mut snapshot, _, workspace) = native.preview(session, false)?;
             if small_plain_rollout
                 && snapshot.events.last().is_some_and(|event| {
                     event.source.raw_record_type.as_deref()
