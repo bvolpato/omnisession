@@ -74,17 +74,24 @@ printf '%s\n' '#!/usr/bin/env sh' \
     '    exit 23' \
     'fi' \
     'output=' \
+    'headers=' \
     'url=' \
     'while [ "$#" -gt 0 ]; do' \
     '    case "$1" in' \
     '        --output|-o) shift; output=$1 ;;' \
+    '        --dump-header|-D) shift; headers=$1 ;;' \
     '        *) url=$1 ;;' \
     '    esac' \
     '    shift' \
     'done' \
+    'release=https://github.com/bvolpato/omnisession/releases/download/v0.10.1' \
+    '[ "${NO_RELEASE_TAG:-}" != 1 ] || release=https://github.com/bvolpato/omnisession/releases/latest/download' \
     'case "$url" in' \
-    '    */SHA256SUMS) cp "$FIXTURE_DIR/$CHECKSUM_FILE" "$output" ;;' \
-    '    */omni-linux-x86_64.tar.gz) cp "$FIXTURE_DIR/omni-linux-x86_64.tar.gz" "$output" ;;' \
+    '    https://github.com/bvolpato/omnisession/releases/latest/download/SHA256SUMS)' \
+    '        printf "HTTP/1.1 302 Found\r\nLocation: %s/SHA256SUMS\r\n\r\n" "$release" >"$headers"' \
+    '        printf "HTTP/1.1 200 OK\r\n\r\n" >>"$headers"' \
+    '        cp "$FIXTURE_DIR/$CHECKSUM_FILE" "$output" ;;' \
+    '    "$release/omni-linux-x86_64.tar.gz") cp "$FIXTURE_DIR/omni-linux-x86_64.tar.gz" "$output" ;;' \
     '    *) exit 1 ;;' \
     'esac' >"$tool_dir/curl"
 chmod 0755 "$tool_dir/curl"
@@ -99,6 +106,18 @@ HOME="$home_dir" SHELL='/bin/zsh' OMNI_INSTALL_DIR="$install_dir" FIXTURE_DIR="$
 [ ! -e "$home_dir/.zshrc" ] || fail 'fresh installer created a shell PATH block'
 [ ! -e "$home_dir/.omnisession/shims" ] || fail 'fresh installer created provider aliases'
 [ "$("$install_dir/omni" --version)" = 'omni 0.10.1' ] || fail 'installed binary has wrong version'
+grep -Fx 'Downloading OmniSession 0.10.1 for linux/x86_64...' "$output_path" >/dev/null || \
+    fail 'installer did not print the version that it downloads'
+grep -Fx "Installed omni 0.10.1 to $install_dir/omni" "$output_path" >/dev/null || \
+    fail 'installer did not print the version that it installed'
+
+# Without a release tag in the redirect, the installer uses the latest URL and prints no version.
+untagged_output="$temp_dir/untagged-output"
+HOME="$home_dir" OMNI_INSTALL_DIR="$temp_dir/untagged-bin" FIXTURE_DIR="$fixture_dir" NO_RELEASE_TAG=1 \
+    CHECKSUM_FILE='SHA256SUMS' PATH="$tool_dir:$PATH" sh "$project_root/install.sh" >"$untagged_output" 2>&1 || \
+    fail 'installer failed without a release tag'
+grep -Fx "Installed omni to $temp_dir/untagged-bin/omni" "$untagged_output" >/dev/null || \
+    fail 'installer printed a version without a release tag'
 
 alias_directory="$home_dir/.omnisession/shims"
 provider_directory="$temp_dir/providers"
