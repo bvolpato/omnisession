@@ -22,7 +22,7 @@ download() {
     while [ "$download_attempt" -le 5 ]; do
         if curl --http1.1 --fail --location --silent --show-error \
             --connect-timeout 15 --speed-limit 1024 --speed-time 30 --proto '=https' --tlsv1.2 \
-            --output "$download_output" "$download_url"; then
+            --dump-header "$headers_path" --output "$download_output" "$download_url"; then
             return
         fi
         [ "$download_attempt" -eq 5 ] && break
@@ -165,17 +165,25 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 archive_name="omni-${platform}-${architecture}.tar.gz"
-release_url="https://github.com/${repository}/releases/latest/download"
+releases_url="https://github.com/${repository}/releases"
+release_url="$releases_url/latest/download"
 archive_path="$temp_dir/$archive_name"
 checksums_path="$temp_dir/SHA256SUMS"
+headers_path="$temp_dir/headers"
 
 if [ ! -t 1 ]; then
     info "OmniSession installer: ${platform}/${architecture} -> ${OMNI_INSTALL_DIR}"
 fi
 
-info "Downloading OmniSession for ${platform}/${architecture}..."
-download "$archive_path" "$release_url/$archive_name"
 download "$checksums_path" "$release_url/SHA256SUMS"
+# GitHub redirects the latest release to its tag. Download the archive from the same release.
+version=$(LC_ALL=C sed -n 's|^[Ll]ocation: .*/releases/download/v\([0-9][0-9A-Za-z.-]*\)/.*|\1|p' "$headers_path" | head -n 1)
+if [ -n "$version" ]; then
+    release_url="$releases_url/download/v$version"
+fi
+
+info "Downloading OmniSession${version:+ $version} for ${platform}/${architecture}..."
+download "$archive_path" "$release_url/$archive_name"
 
 checksum_count=$(awk -v filename="$archive_name" '$2 == filename { count += 1 } END { print count + 0 }' "$checksums_path")
 [ "$checksum_count" -eq 1 ] || die "SHA256SUMS does not contain exactly one checksum for $archive_name"
@@ -237,5 +245,5 @@ if [ "${OMNI_NO_MODIFY_PATH:-}" != '1' ]; then
         remove_old_path_block "$profile"
     done
 fi
-info "Installed omni to $OMNI_INSTALL_DIR/omni"
+info "Installed omni${version:+ $version} to $OMNI_INSTALL_DIR/omni"
 }

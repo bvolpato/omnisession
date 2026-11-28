@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Print the version that the Linux and macOS installer downloads and installs. The checksum and the archive now always come from the same release.
+
 ## 0.10.7 - 2026-11-26
 
 **This release reads every session again once.** The first index pass after the upgrade rebuilds the search index, so stored text gets the new redaction and the history that earlier versions missed. Sessions stay searchable on their old documents until the pass reaches them. The pass needs no action, and `omni index` starts it now. In a synthetic benchmark (1,500 sessions, 208 MB), it took 16% fewer CPU instructions than the same pass with 0.10.6, and the store file grew by 12% instead of 36%. New sessions reuse that space. ([#322](https://github.com/bvolpato/omnisession/pull/322))
