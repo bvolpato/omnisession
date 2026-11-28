@@ -4,7 +4,11 @@
 
 ### Changed
 
-- Print the version that the Linux and macOS installer downloads and installs. The checksum and the archive now always come from the same release.
+- Print the version that the Linux and macOS installer downloads and installs. The checksum and the archive now always come from the same release. ([#326](https://github.com/bvolpato/omnisession/pull/326))
+
+### Fixed
+
+- Import into Hermes 0.23.3 and newer. Those releases removed the method that OmniSession used, so each import failed.
 
 ## 0.10.7 - 2026-11-26
 

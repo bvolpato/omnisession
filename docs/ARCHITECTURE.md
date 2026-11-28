@@ -118,7 +118,7 @@ When a shared state database selects a rollout outside the current Codex home, a
 The planner chooses the safest available mode ([RFC 004](rfcs/004-transfer-modes.md)):
 
 1. **Native resume or fork** for the same agent, from metadata without parsing the full trajectory.
-2. **Official documented import:** Codex app-server import, OpenCode import and export, Grok ACP session import, and Hermes `SessionDB.import_sessions`.
+2. **Official documented import:** Codex app-server import, OpenCode import and export, Grok ACP session import, and Hermes `import_sessions`.
 3. **Verified native materialization:** version-gated private writers for Claude Code, Pi, Antigravity CLI, Cursor Agent, and Cursor IDE.
 4. **Semantic handoff** into a fresh target session, from a private handoff file that quotes redacted history as untrusted context.
 5. **Portable export and import** through a redacted canonical bundle ([RFC 008](rfcs/008-portable-bundle.md)).

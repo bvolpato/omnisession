@@ -875,9 +875,31 @@ fn version_from_metadata(text: &str, direct_script: Option<&Path>) -> Result<Str
 }
 
 fn run_provider_import(binary: &Path, root: &Path, payload: &[u8]) -> Result<serde_json::Value> {
-    const SCRIPT: &str = r#"import json, sqlite3, sys
-from hermes_state import SessionDB
-db = SessionDB()
+    const SCRIPT: &str = r#"import dataclasses, json, sqlite3, sys
+try:
+    from persistence_assembly import open_persistence, profile_scope
+except ModuleNotFoundError as error:
+    # Hermes before 0.23.3 has no storage interface.
+    if error.name != "persistence_assembly":
+        raise
+    from hermes_state import SessionDB
+    db = SessionDB()
+    def next_title(title):
+        return db.get_next_title_in_lineage(title)
+    def import_sessions(payload):
+        return db.import_sessions(payload)
+else:
+    db = open_persistence(profile_scope())
+    def next_title(title):
+        return db.sessions.next_title_in_lineage(title)
+    def import_sessions(payload):
+        return dataclasses.asdict(db.maintenance.import_sessions(payload))
+def is_title_conflict(error):
+    # The storage interface raises its own error and keeps the SQLite error as the cause.
+    return any(
+        isinstance(cause, sqlite3.IntegrityError) and "sessions.title" in str(cause)
+        for cause in (error, error.__cause__)
+    )
 try:
     payload = json.load(sys.stdin)
     record = payload[0]
@@ -885,13 +907,13 @@ try:
     resolved_title = base_title
     for _ in range(16):
         if base_title:
-            resolved_title = db.get_next_title_in_lineage(base_title)
+            resolved_title = next_title(base_title)
             record["title"] = resolved_title
         try:
-            result = db.import_sessions(payload)
+            result = import_sessions(payload)
             break
-        except sqlite3.IntegrityError as error:
-            if not base_title or "sessions.title" not in str(error):
+        except Exception as error:
+            if not base_title or not is_title_conflict(error):
                 raise
     else:
         raise RuntimeError("could not allocate a unique Hermes session title")
