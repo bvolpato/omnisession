@@ -9270,8 +9270,14 @@ mod tests {
         }
     }
 
+    // Thread CPU time leaves out the time that a busy machine gives to other threads.
+    #[cfg(unix)]
     #[test]
     fn cut_off_private_keys_take_linear_time() {
+        let cpu_time = || {
+            let now = rustix::time::clock_gettime(rustix::time::ClockId::ThreadCPUTime);
+            std::time::Duration::try_from(now).expect("thread CPU time")
+        };
         let data = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj";
         for unit in [
             format!("-----BEGIN PRIVATE KEY-----\n{}\n", "A".repeat(32)),
@@ -9284,9 +9290,9 @@ mod tests {
                 let input = unit.repeat(bytes / unit.len());
                 (0..3)
                     .map(|_| {
-                        let start = std::time::Instant::now();
+                        let start = cpu_time();
                         std::hint::black_box(redact_secrets(&input));
-                        start.elapsed()
+                        cpu_time().saturating_sub(start)
                     })
                     .min()
                     .expect("timed run")
